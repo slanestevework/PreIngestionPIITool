@@ -1,0 +1,6 @@
+streamlit
+pandas
+presidio-analyzer
+spacy
+openpyxl
+pyarrow
