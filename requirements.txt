@@ -4,3 +4,6 @@ presidio-analyzer
 spacy
 openpyxl
 pyarrow
+fastapi
+uvicorn[standard]
+python-multipart
