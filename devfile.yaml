@@ -1,5 +1,9 @@
 schemaVersion: 2.2.0
 
+metadata:
+  name: PreIngestionPIITool
+  displayName: PII Scanner Tool
+
 components:
   - name: universal-developer-image
     container:
@@ -12,3 +16,38 @@ components:
       cpuRequest: "1"
 
       sourceMapping: /projects
+      
+      env:
+        - name: PYTHONUNBUFFERED
+          value: "1"
+
+commands:
+  - id: install-dependencies
+    exec:
+      label: "Install dependencies"
+      component: universal-developer-image
+      workingDir: /projects/PreIngestionPIITool
+      commandLine: pip install -r requirements.txt
+
+  - id: run-streamlit
+    exec:
+      label: "Run Streamlit app"
+      component: universal-developer-image
+      workingDir: /projects/PreIngestionPIITool
+      commandLine: streamlit run app.py --server.port=8501 --server.address=0.0.0.0
+
+  - id: run-api
+    exec:
+      label: "Run FastAPI server"
+      component: universal-developer-image
+      workingDir: /projects/PreIngestionPIITool
+      commandLine: uvicorn api:app --host 0.0.0.0 --port 8000 --reload
+
+events:
+  postStart:
+    - install-dependencies
+
+projects:
+  - name: PreIngestionPIITool
+    clonePath: PreIngestionPIITool
+    sourceLocation: /projects/PreIngestionPIITool
