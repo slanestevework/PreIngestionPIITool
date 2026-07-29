@@ -1,0 +1,14 @@
+schemaVersion: 2.2.0
+
+components:
+  - name: universal-developer-image
+    container:
+      image: registry.redhat.io/devspaces/udi-rhel9
+
+      memoryLimit: 6Gi
+      memoryRequest: 2Gi
+
+      cpuLimit: "2"
+      cpuRequest: "1"
+
+      sourceMapping: /projects
