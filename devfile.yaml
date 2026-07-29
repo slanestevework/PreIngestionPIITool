@@ -11,9 +11,6 @@ components:
       memoryLimit: 6Gi
       memoryRequest: 2Gi
 
-      cpuLimit: "2"
-      cpuRequest: "1"
-
       sourceMapping: /projects
 
 projects:
