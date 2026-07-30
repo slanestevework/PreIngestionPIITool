@@ -3,6 +3,12 @@ schemaVersion: 2.2.0
 metadata:
   name: preingestionpiitool
 
+endpoints:
+  - name: api
+    targetPort: 8000
+    exposure: public
+    protocol: https
+
 components:
   - name: universal-developer-image
     container:
