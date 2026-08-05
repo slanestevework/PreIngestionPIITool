@@ -8,6 +8,21 @@ analyzer = AnalyzerEngine()
 
 
 SAMPLE_LIMIT = 500
+PRESIDIO_PRIORITY_COLUMN_HINTS = {
+    "name",
+    "address",
+    "street",
+    "city",
+    "location",
+    "note",
+    "notes",
+    "narrative",
+    "comment",
+    "comments",
+    "description",
+    "message",
+    "text",
+}
 
 def presidio_scan(values):
 
@@ -82,6 +97,11 @@ def presidio_scan(values):
 def is_candidate_column(col_name: str) -> bool:
     col_lower = col_name.lower()
     return any(hint in col_lower for hint in PII_NAME_HINTS)
+
+
+def should_prioritize_presidio(col_name: str) -> bool:
+    col_lower = col_name.lower()
+    return any(hint in col_lower for hint in PRESIDIO_PRIORITY_COLUMN_HINTS)
 
 
 def sample_values(series):
@@ -171,6 +191,23 @@ def should_run_presidio(values):
         or multi_word_pct > 0.25
     )
 
+
+def should_scan_column(col_name: str, values, source_name: str) -> bool:
+    if source_name.lower().endswith(".txt"):
+        return True
+
+    if is_candidate_column(col_name):
+        return True
+
+    return should_run_presidio(values)
+
+
+def has_dominant_regex_match(matches: dict[str, int], sample_size: int) -> bool:
+    if sample_size <= 0:
+        return False
+
+    return any((count / sample_size) >= 0.8 for count in matches.values())
+
 def scan_dataframe(df, source_name):
     findings = []
 
@@ -181,26 +218,27 @@ def scan_dataframe(df, source_name):
     }
 
     for col in df.columns:
-    
-        # Always scan text-file columns
-        if source_name.lower().endswith(".txt"):
-            pass
+        values = sample_values(df[col])
 
-        elif not is_candidate_column(col):
+        if not should_scan_column(col, values, source_name):
             continue
 
         stats["columns_scanned"] += 1
-
-        values = sample_values(df[col])
         matches, regex_samples = scan_column(values)
 
         presidio_matches = {}
         presidio_samples = {}
         presidio_scores = {}
+        prioritize_presidio = should_prioritize_presidio(col)
+        dominant_regex_match = has_dominant_regex_match(matches, len(values))
 
         if (
-            should_run_presidio(values)
-            and len(matches) == 0
+            len(values) > 0
+            and (
+                should_run_presidio(values)
+                or prioritize_presidio
+            )
+            and (prioritize_presidio or not dominant_regex_match)
         ):
             print(
                 f"Running Presidio on {col}"
@@ -250,7 +288,7 @@ def scan_dataframe(df, source_name):
                 "sample_size": len(values),
                 "match_pct": match_pct,
 
-                "presidio_score": "",
+                "presidio_score": None,
 
                 "sample_match_1":
                     examples[0]

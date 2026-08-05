@@ -10,6 +10,7 @@ from fastapi import Depends, FastAPI, File, Header, HTTPException, UploadFile
 from pydantic import BaseModel, Field
 
 from scanner import scan_dataframe
+from data_quality import DQReport, validate_input
 
 
 class ScanRecordsRequest(BaseModel):
@@ -129,3 +130,37 @@ async def scan_file(file: UploadFile = File(...)) -> dict[str, Any]:
 
     source_name = file.filename or "uploaded_file"
     return _scan_dataframe(df=df, source_name=source_name)
+
+
+@app.post("/quality/validate", dependencies=[Depends(_require_api_key)])
+def quality_validate_records(request: ScanRecordsRequest) -> dict:
+    """Run Great Expectations data quality checks on a JSON record payload."""
+    if not request.records:
+        raise HTTPException(status_code=400, detail="records must not be empty")
+
+    df = pd.DataFrame(request.records)
+    report: DQReport = validate_input(df)
+    return report.to_dict()
+
+
+@app.post("/quality/validate/file", dependencies=[Depends(_require_api_key)])
+async def quality_validate_file(file: UploadFile = File(...)) -> dict:
+    """Run Great Expectations data quality checks on an uploaded file."""
+    extension = Path(file.filename or "").suffix.lower().lstrip(".")
+    if extension not in SUPPORTED_EXTENSIONS:
+        raise HTTPException(
+            status_code=400,
+            detail="Unsupported file type. Use csv, json, parquet, txt, xlsx, or xls.",
+        )
+
+    payload = await file.read()
+    if not payload:
+        raise HTTPException(status_code=400, detail="Uploaded file is empty")
+
+    try:
+        df = _load_dataframe_from_upload(file, payload)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    report: DQReport = validate_input(df)
+    return report.to_dict()

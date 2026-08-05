@@ -1,9 +1,0 @@
-source,columns_scanned,findings
-./data\presidio_rich_notes.txt,1,3
-./data\presidio_rich_sample.csv,6,11
-./data\presidio_rich_sample.json,6,11
-./data\presidio_rich_sample.xlsx,6,11
-./data\sample_pii.csv,4,5
-./data\sample_pii.json,3,3
-./data\sample_pii.txt,1,4
-./data\sample_pii.xlsx,4,4

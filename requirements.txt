@@ -7,3 +7,7 @@ pyarrow
 fastapi
 uvicorn[standard]
 python-multipart
+great-expectations>=1.0
+scikit-learn
+openai>=1.0
+python-dotenv

@@ -7,11 +7,27 @@ import re
 import zipfile
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import Any, Hashable
 
 import pandas as pd
 import streamlit as st
 
+from data_quality import (
+    validate_input,
+    validate_output,
+    DQReport,
+    detect_anomalies,
+    AnomalyResult,
+    generate_narrative,
+    assess_semantic_pii_risk,
+    SemanticRisk,
+    assess_regulatory_risk,
+    RegulatoryFlag,
+    detect_quasi_identifiers,
+    QuasiIdentifierGroup,
+    detect_format_anomalies,
+    FormatAnomaly,
+)
 from patterns import PII_REGEXES
 from scanner import analyzer as presidio_analyzer
 from scanner import scan_dataframe
@@ -116,6 +132,114 @@ def summarize_findings(findings_df: pd.DataFrame) -> dict[str, int]:
     }
 
 
+PATTERN_DISPLAY_ALIASES = {
+    "PHONE_NUMBER": "Phone",
+    "EMAIL_ADDRESS": "Email",
+    "US_SSN": "SSN",
+    "CREDIT_CARD": "Credit Card",
+    "IP_ADDRESS": "IP",
+    "PERSON": "Person",
+    "LOCATION": "Location",
+}
+
+NAME_LIKE_COLUMN_HINTS = {"name", "customer_name", "employee_name", "user_name", "full_name"}
+FULL_NAME_PATTERN = re.compile(
+    r"^\s*[A-Z][a-z]+(?:[-'][A-Z][a-z]+)?(?:\s+[A-Z][a-z]+(?:[-'][A-Z][a-z]+)?){1,2}\s*$"
+)
+PERSON_CONTEXT_PATTERN = re.compile(
+    r"\b([A-Z][a-z]+(?:[-'][A-Z][a-z]+)?\s+[A-Z][a-z]+(?:[-'][A-Z][a-z]+)?)(?=\s+(?:called|met|requested|asked|reported|stated|emailed|contacted)\b)"
+)
+LOCATION_FULL_ADDRESS_PATTERN = re.compile(
+    r"\b\d{1,6}\s+[A-Za-z0-9.'-]+(?:\s+[A-Za-z0-9.'-]+){0,4}\s(?:Street|St|Avenue|Ave|Road|Rd|Lane|Ln|Drive|Dr|Boulevard|Blvd|Way|Court|Ct)(?:,\s*[A-Z][a-z]+(?:\s+[A-Z][a-z]+)*\s+(?:AL|GA|NC|TN)(?:\s+\d{5})?)?\b"
+)
+LOCATION_STREET_PATTERN = re.compile(
+    r"\b\d{1,6}\s+[A-Za-z0-9.'-]+(?:\s+[A-Za-z0-9.'-]+){0,4}\s(?:Street|St|Avenue|Ave|Road|Rd|Lane|Ln|Drive|Dr|Boulevard|Blvd|Way|Court|Ct)\b"
+)
+LOCATION_CITY_STATE_ZIP_PATTERN = re.compile(
+    r"\b([A-Z][a-z]+(?:\s+[A-Z][a-z]+)*)\s+(AL|GA|NC|TN)\s+\d{5}\b"
+)
+LOCATION_CITY_STATE_PATTERN = re.compile(
+    r"\b([A-Z][a-z]+(?:\s+[A-Z][a-z]+)*)\s+(AL|GA|NC|TN)\b"
+)
+REMEDIATION_PATTERN_PRIORITY = {
+    "LOCATION": 10,
+    "PERSON": 20,
+    "EMAIL_ADDRESS": 30,
+    "PHONE_NUMBER": 40,
+    "email": 50,
+    "phone": 60,
+    "ssn": 70,
+    "zip": 80,
+    "DATE_TIME": 90,
+    "URL": 100,
+}
+
+REMEDIATION_PATTERN_OPTIONS = sorted(
+    set(PII_REGEXES.keys())
+    | {
+        "PERSON",
+        "LOCATION",
+        "EMAIL_ADDRESS",
+        "PHONE_NUMBER",
+        "DATE_TIME",
+        "URL",
+        "US_SSN",
+        "CREDIT_CARD",
+        "IP_ADDRESS",
+        "UK_NHS",
+    }
+)
+
+
+def format_pattern_label(pattern: Any, detection_source: Any) -> str:
+    raw_pattern = str(pattern or "").strip()
+    raw_source = str(detection_source or "").strip()
+
+    if not raw_pattern:
+        return ""
+
+    display_name = PATTERN_DISPLAY_ALIASES.get(raw_pattern)
+    if display_name is None:
+        normalized = raw_pattern.replace("_", " ").strip()
+        display_name = normalized.title() if normalized else raw_pattern
+
+    source_suffix = {
+        "REGEX_RULE": "Regex",
+        "PRESIDIO_NLP": "NLP",
+        "STRICT_FALLBACK": "Fallback",
+    }.get(raw_source)
+
+    return f"{display_name}({source_suffix})" if source_suffix else display_name
+
+
+def with_display_pattern(df: pd.DataFrame) -> pd.DataFrame:
+    if df.empty or "pattern" not in df.columns:
+        return df
+
+    display_df = df.copy()
+    display_df["pattern"] = display_df.apply(
+        lambda row: format_pattern_label(
+            row.get("pattern"),
+            row.get("detection_source"),
+        ),
+        axis=1,
+    )
+    return display_df
+
+
+def coerce_text(value: Any) -> str:
+    if isinstance(value, str):
+        return value
+    if pd.isna(value):
+        return ""
+    return str(value)
+
+
+def is_name_like_column(column_name: str) -> bool:
+    col_lower = column_name.lower()
+    return any(hint in col_lower for hint in NAME_LIKE_COLUMN_HINTS)
+
+
 def anonymize_dataframe(df: pd.DataFrame, findings_df: pd.DataFrame) -> pd.DataFrame:
     anonymized = df.copy()
     if findings_df.empty:
@@ -191,7 +315,7 @@ def replace_by_regex(series: pd.Series, pattern_name: str, remediation_mode: str
     updated_values = []
     changed = 0
 
-    for value in series.astype(str):
+    for value in series.fillna("").astype(str):
         stripped = value.strip()
         if regex_pattern.fullmatch(stripped):
             updated_values.append(transform_value(stripped, pattern_name, remediation_mode, salt))
@@ -228,6 +352,7 @@ def replace_by_samples(series: pd.Series, pattern_name: str, samples: list[str],
 
 def replace_by_presidio_entity(
     series: pd.Series,
+    column_name: str,
     entity_type: str,
     remediation_mode: str,
     salt: str,
@@ -238,7 +363,25 @@ def replace_by_presidio_entity(
     changed = 0
 
     for original in series.astype(str):
-        value = original
+        value = coerce_text(original)
+
+        if (
+            entity_type == "PERSON"
+            and strict_person_fallback
+        ):
+            value = apply_person_context_fallback(
+                value,
+                column_name,
+                remediation_mode,
+                salt,
+            )
+
+        if (
+            entity_type == "LOCATION"
+            and strict_location_fallback
+        ):
+            value = apply_location_context_fallback(value, remediation_mode, salt)
+
         entities = presidio_analyzer.analyze(text=value, language="en")
         target_entities = [e for e in entities if e.entity_type == entity_type]
 
@@ -248,22 +391,6 @@ def replace_by_presidio_entity(
             replacement = transform_value(detected_text, entity_type, remediation_mode, salt)
             value = value[:entity.start] + replacement + value[entity.end:]
 
-        if (
-            entity_type == "PERSON"
-            and strict_person_fallback
-            and "requested that documents be mailed" in value
-        ):
-            # Fallback for templated note lines where PERSON can be missed by NLP.
-            value = apply_person_template_fallback(value, remediation_mode, salt)
-
-        if (
-            entity_type == "LOCATION"
-            and strict_location_fallback
-            and "requested that documents be mailed to" in value
-        ):
-            # Fallback for address narrative lines where LOCATION can be missed by NLP.
-            value = apply_location_template_fallback(value, remediation_mode, salt)
-
         if value != original:
             changed += 1
         updated_values.append(value)
@@ -271,38 +398,44 @@ def replace_by_presidio_entity(
     return pd.Series(updated_values, index=series.index), changed
 
 
-def apply_person_template_fallback(value: str, remediation_mode: str, salt: str) -> str:
-    person_pattern = re.compile(
-        r"\b([A-Z][a-z]+\s+[A-Z][a-z]+)(?=\s+requested\s+that\s+documents\s+be\s+mailed)",
-    )
+def apply_person_context_fallback(
+    value: str,
+    column_name: str,
+    remediation_mode: str,
+    salt: str,
+) -> str:
+    value = coerce_text(value)
+    stripped = value.strip()
+    if is_name_like_column(column_name) and FULL_NAME_PATTERN.fullmatch(stripped):
+        return transform_value(stripped, "PERSON", remediation_mode, salt)
 
     def _replace(match: re.Match) -> str:
         detected_name = match.group(1)
         return transform_value(detected_name, "PERSON", remediation_mode, salt)
 
-    return person_pattern.sub(_replace, value)
+    return PERSON_CONTEXT_PATTERN.sub(_replace, value)
 
 
-def apply_location_template_fallback(value: str, remediation_mode: str, salt: str) -> str:
-    # Redact address segment patterns in templated mailing narrative lines.
-    street_pattern = re.compile(
-        r"\b\d{1,6}\s+[A-Za-z0-9.'-]+(?:\s+[A-Za-z0-9.'-]+){0,4}\s(?:Street|St|Avenue|Ave|Road|Rd|Lane|Ln|Drive|Dr|Boulevard|Blvd|Way|Court|Ct)\b",
-    )
-    city_state_zip_pattern = re.compile(
-        r"\b([A-Z][a-z]+(?:\s+[A-Z][a-z]+)*)\s+(AL|GA|NC|TN)\s+\d{5}\b",
-    )
+def apply_location_context_fallback(value: str, remediation_mode: str, salt: str) -> str:
+    value = coerce_text(value)
 
-    def _replace_street(match: re.Match) -> str:
+    def _replace(match: re.Match) -> str:
         detected = match.group(0)
         return transform_value(detected, "LOCATION", remediation_mode, salt)
 
-    def _replace_city_state_zip(match: re.Match) -> str:
-        detected = match.group(0)
-        return transform_value(detected, "LOCATION", remediation_mode, salt)
-
-    updated = street_pattern.sub(_replace_street, value)
-    updated = city_state_zip_pattern.sub(_replace_city_state_zip, updated)
+    updated = LOCATION_FULL_ADDRESS_PATTERN.sub(_replace, value)
+    updated = LOCATION_STREET_PATTERN.sub(_replace, updated)
+    updated = LOCATION_CITY_STATE_ZIP_PATTERN.sub(_replace, updated)
+    updated = LOCATION_CITY_STATE_PATTERN.sub(_replace, updated)
     return updated
+
+
+def remediation_priority(finding: dict[Hashable, Any]) -> tuple[int, int, str]:
+    detection_source = str(finding.get("detection_source", ""))
+    pattern = str(finding.get("pattern", ""))
+    source_priority = 0 if detection_source == "PRESIDIO_NLP" else 1
+    pattern_priority = REMEDIATION_PATTERN_PRIORITY.get(pattern, 999)
+    return source_priority, pattern_priority, pattern
 
 
 def sub_with_transform(
@@ -323,6 +456,7 @@ def replace_contextual_digit_tokens(
     value: str,
     remediation_mode: str,
     salt: str,
+    selected_patterns: set[str] | None,
 ) -> tuple[str, set[str]]:
     updated = value
     changed_types: set[str] = set()
@@ -340,7 +474,7 @@ def replace_contextual_digit_tokens(
         elif any(k in context for k in ["account", "acct", "bank", "iban"]):
             replacement_label = "bank_account"
 
-        if replacement_label:
+        if replacement_label and (not selected_patterns or replacement_label in selected_patterns):
             replacement = transform_value(token, replacement_label, remediation_mode, salt)
             updated = updated[:start] + replacement + updated[end:]
             changed_types.add(replacement_label)
@@ -353,6 +487,7 @@ def apply_common_pii_fallback_value(
     remediation_mode: str,
     salt: str,
     enable_contextual_date_fallback: bool,
+    selected_patterns: set[str] | None,
 ) -> tuple[str, set[str]]:
     updated = value
     changed_types: set[str] = set()
@@ -367,6 +502,9 @@ def apply_common_pii_fallback_value(
     ]
 
     for pattern_name, regex in simple_patterns:
+        if selected_patterns and pattern_name not in selected_patterns:
+            continue
+
         updated, replacements = sub_with_transform(
             updated,
             regex,
@@ -381,10 +519,11 @@ def apply_common_pii_fallback_value(
         updated,
         remediation_mode,
         salt,
+        selected_patterns,
     )
     changed_types.update(contextual_types)
 
-    if enable_contextual_date_fallback:
+    if enable_contextual_date_fallback and (not selected_patterns or "dob" in selected_patterns):
         date_context = updated.lower()
         if any(k in date_context for k in ["dob", "birth", "born", "date of birth"]):
             date_regex = re.compile(r"(?<!\d)(?:0?[1-9]|1[0-2])[/-](?:0?[1-9]|[12]\d|3[01])[/-]\d{4}(?!\d)")
@@ -406,6 +545,7 @@ def apply_common_pii_fallback_series(
     remediation_mode: str,
     salt: str,
     enable_contextual_date_fallback: bool,
+    selected_patterns: set[str] | None,
 ) -> tuple[pd.Series, dict[str, int]]:
     updated_values = []
     type_change_counts: dict[str, int] = {}
@@ -416,6 +556,7 @@ def apply_common_pii_fallback_series(
             remediation_mode,
             salt,
             enable_contextual_date_fallback,
+            selected_patterns,
         )
         for changed_type in changed_types:
             type_change_counts[changed_type] = type_change_counts.get(changed_type, 0) + 1
@@ -435,6 +576,7 @@ def remediate_dataframe(
     strict_location_fallback: bool,
     strict_common_fallback: bool,
     strict_date_fallback: bool,
+    selected_patterns: set[str] | None,
 ) -> tuple[pd.DataFrame, list[RemediationRecord]]:
     remediated = df.copy()
     records: list[RemediationRecord] = []
@@ -443,13 +585,29 @@ def remediate_dataframe(
     if findings_df.empty:
         return remediated, records
 
-    for _, finding in findings_df.iterrows():
-        column = finding.get("column")
-        pattern = finding.get("pattern")
-        risk = finding.get("risk", "")
+    ordered_findings = sorted(
+        findings_df.to_dict("records"),
+        key=remediation_priority,
+    )
+
+    for finding in ordered_findings:
+        raw_column = finding.get("column")
+        raw_pattern = finding.get("pattern")
+        risk = str(finding.get("risk", ""))
         detection_source = str(finding.get("detection_source", ""))
 
+        if not isinstance(raw_column, str) or not raw_column:
+            continue
+        if not isinstance(raw_pattern, str) or not raw_pattern:
+            continue
+
+        column = raw_column
+        pattern = raw_pattern
+
         if column not in remediated.columns or not pattern:
+            continue
+
+        if selected_patterns and pattern not in selected_patterns:
             continue
 
         touched_columns.add(column)
@@ -467,6 +625,7 @@ def remediate_dataframe(
         elif detection_source == "PRESIDIO_NLP":
             updated_series, changed = replace_by_presidio_entity(
                 remediated[column],
+                column,
                 pattern,
                 remediation_mode,
                 hash_salt,
@@ -510,6 +669,7 @@ def remediate_dataframe(
                 remediation_mode,
                 hash_salt,
                 strict_date_fallback,
+                selected_patterns,
             )
 
             if fallback_counts:
@@ -565,6 +725,13 @@ st.caption("Scan files locally for PII before they leave your workstation.")
 with st.sidebar:
     st.header("Scan Options")
     run_scan = st.checkbox("Detect PII", value=True)
+    run_dq = st.checkbox("Run data quality checks", value=True)
+    run_anomaly = st.checkbox("Anomaly detection (AI)", value=False, disabled=not run_dq)
+    run_narrative = st.checkbox("DQ failure narrative (Azure OpenAI)", value=False, disabled=not run_dq)
+    run_semantic = st.checkbox("Semantic PII risk (Azure OpenAI)", value=False, disabled=not run_dq)
+    run_regulatory = st.checkbox("Regulatory risk flags — HIPAA/GDPR/CCPA (Azure OpenAI)", value=False, disabled=not run_dq)
+    run_quasi = st.checkbox("Quasi-identifier detection (Azure OpenAI)", value=False, disabled=not run_dq)
+    run_format = st.checkbox("Format anomaly check (Azure OpenAI)", value=False, disabled=not run_dq)
     include_presidio = st.checkbox("Include Presidio findings", value=True)
     show_samples = st.checkbox("Show sample values", value=True)
     build_anonymized = st.checkbox("Generate anonymized copy", value=True)
@@ -573,7 +740,7 @@ with st.sidebar:
         "Max file size (MB)",
         min_value=1,
         max_value=1024,
-        value=25,
+        value=1024,
         step=1,
         disabled=not skip_large_files,
         help="Files larger than this limit are skipped when the option is enabled.",
@@ -593,6 +760,13 @@ with st.sidebar:
         "Also remediate REVIEW findings",
         value=True,
         help="REVIEW findings usually come from NLP and may include false positives.",
+    )
+    selected_remediation_patterns = st.multiselect(
+        "PII types to remediate",
+        options=REMEDIATION_PATTERN_OPTIONS,
+        default=REMEDIATION_PATTERN_OPTIONS,
+        format_func=lambda p: f"{format_pattern_label(p, '')} ({p})",
+        help="Only selected types will be redacted/masked/hashed in cloud-ready outputs.",
     )
     strict_person_fallback = st.checkbox(
         "Strict fallback for missed names in narrative text",
@@ -627,7 +801,7 @@ with st.sidebar:
         disabled=remediation_mode != "hash",
         help="Used only for hash mode to produce deterministic tokens.",
     )
-    run_clicked = st.button("Scan", type="primary", use_container_width=True)
+    run_clicked = st.button("Scan", type="primary", width="stretch")
 
 uploaded_files = st.file_uploader(
     "Upload multiple files or a ZIP archive",
@@ -650,6 +824,14 @@ if run_clicked and input_files and run_scan:
     all_findings: list[dict[str, Any]] = []
     all_stats: list[dict[str, Any]] = []
     file_statuses: list[FileStatus] = []
+    dq_input_reports: dict[str, DQReport] = {}
+    dq_output_report: DQReport | None = None
+    anomaly_results: dict[str, list[AnomalyResult]] = {}
+    dq_narratives: dict[str, str] = {}
+    semantic_risks: dict[str, list[SemanticRisk]] = {}
+    regulatory_flags: dict[str, list[RegulatoryFlag]] = {}
+    quasi_groups: dict[str, list[QuasiIdentifierGroup]] = {}
+    format_anomalies: dict[str, list[FormatAnomaly]] = {}
 
     with st.spinner("Scanning files..."):
         for uploaded in input_files:
@@ -670,7 +852,27 @@ if run_clicked and input_files and run_scan:
 
             try:
                 df, ext = load_uploaded_dataframe(uploaded.name, uploaded.payload)
+
+                if run_dq:
+                    dq_input_reports[uploaded.name] = validate_input(df)
+
+                if run_anomaly:
+                    anomaly_results[uploaded.name] = detect_anomalies(df)
+
                 findings, stats = scan_dataframe(df, uploaded.name)
+
+                if run_semantic:
+                    known_cols = {f.get("column") for f in findings if f.get("column")}
+                    semantic_risks[uploaded.name] = assess_semantic_pii_risk(df, known_pii_columns=known_cols)
+
+                if run_regulatory:
+                    regulatory_flags[uploaded.name] = assess_regulatory_risk(df)
+
+                if run_quasi:
+                    quasi_groups[uploaded.name] = detect_quasi_identifiers(df)
+
+                if run_format:
+                    format_anomalies[uploaded.name] = detect_format_anomalies(df)
 
                 if not include_presidio:
                     findings = [
@@ -714,8 +916,20 @@ if run_clicked and input_files and run_scan:
                 )
 
     findings_df = pd.DataFrame(all_findings)
+    findings_display_df = with_display_pattern(findings_df)
     stats_df = pd.DataFrame(all_stats)
     risk_summary = summarize_findings(findings_df)
+
+    if run_dq and not findings_df.empty:
+        dq_output_report = validate_output(findings_df)
+
+    if run_narrative:
+        for fname, report in dq_input_reports.items():
+            if not report.passed:
+                try:
+                    dq_narratives[fname] = generate_narrative(report, file_name=fname)
+                except Exception:
+                    dq_narratives[fname] = ""
 
     c1, c2, c3, c4, c5 = st.columns(5)
     c1.metric("CRITICAL", risk_summary["CRITICAL"])
@@ -729,13 +943,13 @@ if run_clicked and input_files and run_scan:
         st.info("No findings detected for selected options.")
     else:
         top = (
-            findings_df.groupby(["pattern", "risk"], dropna=False)["matches"]
+            findings_display_df.groupby(["pattern", "risk"], dropna=False)["matches"]
             .sum()
             .reset_index()
             .sort_values(by="matches", ascending=False)
             .head(10)
         )
-        st.dataframe(top, use_container_width=True)
+        st.dataframe(top, width="stretch")
 
     st.subheader("Per-File Scan Status")
     status_rows = [
@@ -749,7 +963,7 @@ if run_clicked and input_files and run_scan:
     ]
     status_df = pd.DataFrame(status_rows)
     if not status_df.empty:
-        st.dataframe(status_df, use_container_width=True)
+        st.dataframe(status_df, width="stretch")
         for item in file_statuses:
             badge = f"[{item.state}] {item.file_name} ({item.size_mb} MB)"
             if item.state == "SUCCESS":
@@ -765,10 +979,10 @@ if run_clicked and input_files and run_scan:
     else:
         if not show_samples:
             sample_cols = [f"sample_match_{i}" for i in range(1, 6)]
-            safe_cols = [c for c in findings_df.columns if c not in sample_cols]
-            st.dataframe(findings_df[safe_cols], use_container_width=True)
+            safe_cols = [c for c in findings_display_df.columns if c not in sample_cols]
+            st.dataframe(findings_display_df[safe_cols], width="stretch")
         else:
-            st.dataframe(findings_df, use_container_width=True)
+            st.dataframe(findings_display_df, width="stretch")
 
     st.subheader("Per-File Findings")
     if scans:
@@ -780,21 +994,110 @@ if run_clicked and input_files and run_scan:
                 if scan_findings_df.empty:
                     st.info("No findings for this file.")
                 else:
+                    scan_findings_display_df = with_display_pattern(scan_findings_df)
                     if not show_samples:
                         sample_cols = [f"sample_match_{i}" for i in range(1, 6)]
                         safe_cols = [
-                            c for c in scan_findings_df.columns if c not in sample_cols
+                            c for c in scan_findings_display_df.columns if c not in sample_cols
                         ]
-                        st.dataframe(scan_findings_df[safe_cols], use_container_width=True)
+                        st.dataframe(scan_findings_display_df[safe_cols], width="stretch")
                     else:
-                        st.dataframe(scan_findings_df, use_container_width=True)
+                        st.dataframe(scan_findings_display_df, width="stretch")
     else:
         st.info("No successful file scans to show in per-file tabs.")
 
     st.subheader("File Scan Stats")
-    st.dataframe(stats_df, use_container_width=True)
+    st.dataframe(stats_df, width="stretch")
 
     findings_bytes = findings_df.to_csv(index=False).encode("utf-8")
+
+    if run_dq and (dq_input_reports or dq_output_report):
+        st.subheader("Data Quality")
+        if dq_input_reports:
+            with st.expander("File quality checks", expanded=any(not r.passed for r in dq_input_reports.values())):
+                for fname, report in dq_input_reports.items():
+                    status = "✅ passed" if report.passed else "❌ failed"
+                    st.markdown(f"**{fname}** — {status} ({report.successful}/{report.evaluated} checks)")
+                    if report.failures:
+                        rows = [
+                            {"issue": f.expectation, "column": f.column or "", **f.details}
+                            for f in report.failures
+                        ]
+                        st.dataframe(pd.DataFrame(rows), width="stretch")
+                    narrative = dq_narratives.get(fname, "")
+                    if narrative:
+                        st.info(f"**AI summary:** {narrative}")
+        if anomaly_results:
+            flagged = {f: [a for a in anoms if a.flagged] for f, anoms in anomaly_results.items()}
+            any_flagged = any(flagged.values())
+            with st.expander("Anomaly detection (AI)", expanded=any_flagged):
+                for fname, anoms in flagged.items():
+                    if not anoms:
+                        st.markdown(f"**{fname}** — ✅ no anomalies detected")
+                        continue
+                    st.markdown(f"**{fname}** — ⚠️ {len(anoms)} column(s) with anomalous values")
+                    rows = [
+                        {
+                            "column": a.column,
+                            "anomalous rows": a.anomalous_row_count,
+                            "anomaly %": f"{a.anomaly_pct}%",
+                            "why flagged": getattr(a, "explanation", ""),
+                            "sample values": ", ".join(a.sample_anomalous_values),
+                        }
+                        for a in anoms
+                    ]
+                    st.dataframe(pd.DataFrame(rows), width="stretch")
+        if semantic_risks:
+            any_risks = any(semantic_risks.values())
+            with st.expander("Semantic PII risk (AI)", expanded=any_risks):
+                for fname, risks in semantic_risks.items():
+                    if not risks:
+                        st.markdown(f"**{fname}** — ✅ no additional PII columns identified")
+                        continue
+                    st.markdown(f"**{fname}** — ⚠️ {len(risks)} column(s) flagged by AI")
+                    rows = [{"column": r.column, "risk": r.risk, "reason": r.reason} for r in risks]
+                    st.dataframe(pd.DataFrame(rows), width="stretch")
+        if regulatory_flags:
+            any_flags = any(regulatory_flags.values())
+            with st.expander("Regulatory risk — HIPAA / GDPR / CCPA (AI)", expanded=any_flags):
+                for fname, flags in regulatory_flags.items():
+                    if not flags:
+                        st.markdown(f"**{fname}** — ✅ no regulatory obligations identified")
+                        continue
+                    st.markdown(f"**{fname}** — ⚠️ {len(flags)} regulatory flag(s)")
+                    rows = [{"column": f.column, "regulation": f.regulation, "category": f.category, "severity": f.severity, "obligation": f.obligation} for f in flags]
+                    st.dataframe(pd.DataFrame(rows), width="stretch")
+        if quasi_groups:
+            any_quasi = any(quasi_groups.values())
+            with st.expander("Quasi-identifier detection (AI)", expanded=any_quasi):
+                for fname, groups in quasi_groups.items():
+                    if not groups:
+                        st.markdown(f"**{fname}** — ✅ no quasi-identifier combinations found")
+                        continue
+                    st.markdown(f"**{fname}** — ⚠️ {len(groups)} re-identification risk group(s)")
+                    rows = [{"columns": ", ".join(g.columns), "risk": g.risk, "reason": g.reason} for g in groups]
+                    st.dataframe(pd.DataFrame(rows), width="stretch")
+        if format_anomalies:
+            any_fmt = any(format_anomalies.values())
+            with st.expander("Format anomaly check (AI)", expanded=any_fmt):
+                for fname, anomalies in format_anomalies.items():
+                    if not anomalies:
+                        st.markdown(f"**{fname}** — ✅ all column values match expected formats")
+                        continue
+                    st.markdown(f"**{fname}** — ⚠️ {len(anomalies)} format mismatch(es)")
+                    rows = [{"column": a.column, "expected": a.expected_format, "issue": a.observed_issue, "severity": a.severity} for a in anomalies]
+                    st.dataframe(pd.DataFrame(rows), width="stretch")
+        if dq_output_report:
+            with st.expander("Scanner diagnostics (advanced)", expanded=not dq_output_report.passed):
+                status = "✅ passed" if dq_output_report.passed else "❌ failed"
+                st.markdown(f"Scan output schema — {status} ({dq_output_report.successful}/{dq_output_report.evaluated} checks)")
+                if dq_output_report.failures:
+                    rows = [
+                        {"issue": f.expectation, "column": f.column or "", **f.details}
+                        for f in dq_output_report.failures
+                    ]
+                    st.dataframe(pd.DataFrame(rows), width="stretch")
+
     st.download_button(
         "Download Findings CSV",
         data=findings_bytes,
@@ -819,6 +1122,7 @@ if run_clicked and input_files and run_scan:
                     strict_location_fallback=strict_location_fallback,
                     strict_common_fallback=strict_common_fallback,
                     strict_date_fallback=strict_date_fallback,
+                    selected_patterns=set(selected_remediation_patterns),
                 )
                 remediation_records.extend(scan_records)
                 payload = dataframe_to_bytes(remediated_df, scan.extension)
@@ -858,7 +1162,7 @@ if run_clicked and input_files and run_scan:
                 .reset_index()
                 .sort_values(by="cells_changed", ascending=False)
             )
-            st.dataframe(summary, use_container_width=True)
+            st.dataframe(summary, width="stretch")
 
         st.download_button(
             "Download Cloud-Ready Files (ZIP)",
