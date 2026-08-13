@@ -48,6 +48,14 @@ from ._regulatory import (
     detect_quasi_identifiers,
     detect_format_anomalies,
 )
+from ._dq_intelligence import (
+    PlausibilityIssue,
+    ConsistencyIssue,
+    CompletenessIssue,
+    assess_value_plausibility,
+    detect_consistency_violations,
+    assess_completeness,
+)
 
 __all__ = [
     "validate_input",
@@ -65,6 +73,12 @@ __all__ = [
     "QuasiIdentifierGroup",
     "detect_format_anomalies",
     "FormatAnomaly",
+    "assess_value_plausibility",
+    "PlausibilityIssue",
+    "detect_consistency_violations",
+    "ConsistencyIssue",
+    "assess_completeness",
+    "CompletenessIssue",
 ]
 
 

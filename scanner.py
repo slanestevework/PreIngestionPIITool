@@ -1,5 +1,6 @@
 from datetime import datetime
 import os
+import json
 import pandas as pd
 from patterns import (PII_NAME_HINTS, PII_REGEXES, COLUMN_PATTERN_MAP, HIGH_RISK_PATTERNS)
 from presidio_analyzer import AnalyzerEngine
@@ -23,6 +24,29 @@ PRESIDIO_PRIORITY_COLUMN_HINTS = {
     "message",
     "text",
 }
+
+
+def _load_json_dataframe_from_path(file_path: str) -> pd.DataFrame:
+    # Accept both JSONL and conventional JSON files.
+    with open(file_path, "r", encoding="utf-8-sig") as handle:
+        text_content = handle.read()
+
+    try:
+        parsed = json.loads(text_content)
+    except json.JSONDecodeError:
+        return pd.read_json(file_path, lines=True)
+
+    if isinstance(parsed, list):
+        return pd.json_normalize(parsed)
+
+    if isinstance(parsed, dict):
+        for list_key in ("records", "items", "data", "teas"):
+            candidate = parsed.get(list_key)
+            if isinstance(candidate, list):
+                return pd.json_normalize(candidate)
+        return pd.json_normalize([parsed])
+
+    raise ValueError("Unsupported JSON structure. Expected object, array, or JSON lines.")
 
 def presidio_scan(values):
 
@@ -371,10 +395,7 @@ def read_file(file_path):
             )
 
         elif ext == "json":
-            return pd.read_json(
-                file_path,
-                lines=True
-            )
+            return _load_json_dataframe_from_path(file_path)
 
         elif ext == "parquet":
             return pd.read_parquet(file_path)

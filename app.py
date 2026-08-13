@@ -27,6 +27,12 @@ from data_quality import (
     QuasiIdentifierGroup,
     detect_format_anomalies,
     FormatAnomaly,
+    assess_value_plausibility,
+    PlausibilityIssue,
+    detect_consistency_violations,
+    ConsistencyIssue,
+    assess_completeness,
+    CompletenessIssue,
 )
 from patterns import PII_REGEXES
 from scanner import analyzer as presidio_analyzer
@@ -66,13 +72,35 @@ class RemediationRecord:
     cells_changed: int
 
 
+def _load_json_dataframe_from_bytes(payload: bytes) -> pd.DataFrame:
+    # First try standard JSON (object/array), then fall back to JSONL.
+    text_content = payload.decode("utf-8-sig")
+
+    try:
+        parsed = json.loads(text_content)
+    except json.JSONDecodeError:
+        return pd.read_json(io.BytesIO(payload), lines=True)
+
+    if isinstance(parsed, list):
+        return pd.json_normalize(parsed)
+
+    if isinstance(parsed, dict):
+        for list_key in ("records", "items", "data", "teas"):
+            candidate = parsed.get(list_key)
+            if isinstance(candidate, list):
+                return pd.json_normalize(candidate)
+        return pd.json_normalize([parsed])
+
+    raise ValueError("Unsupported JSON structure. Expected object, array, or JSON lines.")
+
+
 def load_uploaded_dataframe(file_name: str, file_bytes: bytes) -> tuple[pd.DataFrame, str]:
     extension = Path(file_name).suffix.lower().lstrip(".")
 
     if extension == "csv":
         return pd.read_csv(io.BytesIO(file_bytes), dtype=str), extension
     if extension == "json":
-        return pd.read_json(io.BytesIO(file_bytes), lines=True), extension
+        return _load_json_dataframe_from_bytes(file_bytes), extension
     if extension == "parquet":
         return pd.read_parquet(io.BytesIO(file_bytes)), extension
     if extension == "txt":
@@ -725,16 +753,8 @@ st.caption("Scan files locally for PII before they leave your workstation.")
 with st.sidebar:
     st.header("Scan Options")
     run_scan = st.checkbox("Detect PII", value=True)
-    run_dq = st.checkbox("Run data quality checks", value=True)
-    run_anomaly = st.checkbox("Anomaly detection (AI)", value=False, disabled=not run_dq)
-    run_narrative = st.checkbox("DQ failure narrative (Azure OpenAI)", value=False, disabled=not run_dq)
-    run_semantic = st.checkbox("Semantic PII risk (Azure OpenAI)", value=False, disabled=not run_dq)
-    run_regulatory = st.checkbox("Regulatory risk flags — HIPAA/GDPR/CCPA (Azure OpenAI)", value=False, disabled=not run_dq)
-    run_quasi = st.checkbox("Quasi-identifier detection (Azure OpenAI)", value=False, disabled=not run_dq)
-    run_format = st.checkbox("Format anomaly check (Azure OpenAI)", value=False, disabled=not run_dq)
     include_presidio = st.checkbox("Include Presidio findings", value=True)
     show_samples = st.checkbox("Show sample values", value=True)
-    build_anonymized = st.checkbox("Generate anonymized copy", value=True)
     skip_large_files = st.checkbox("Skip very large files", value=True)
     max_file_size_mb = st.number_input(
         "Max file size (MB)",
@@ -745,6 +765,21 @@ with st.sidebar:
         disabled=not skip_large_files,
         help="Files larger than this limit are skipped when the option is enabled.",
     )
+
+    st.header("Data Quality")
+    run_dq = st.checkbox("Run data quality checks", value=True)
+    run_narrative = st.checkbox("DQ failure narrative (Azure OpenAI)", value=False, disabled=not run_dq, help="GPT explains what is wrong and what to do when a check fails.")
+    run_anomaly = st.checkbox("Anomaly detection (AI)", value=False, disabled=not run_dq, help="Isolation Forest flags statistically unusual values per column.")
+    run_plausibility = st.checkbox("Value plausibility (Azure OpenAI)", value=False, disabled=not run_dq, help="GPT checks whether individual values make sense for their column.")
+    run_consistency = st.checkbox("Cross-column consistency (Azure OpenAI)", value=False, disabled=not run_dq, help="GPT checks for contradictions between columns (e.g. end date before start date).")
+    run_completeness = st.checkbox("Completeness assessment (Azure OpenAI)", value=False, disabled=not run_dq, help="GPT identifies columns that appear incomplete or companion columns that are missing.")
+
+    st.header("AI — PII & Compliance")
+    run_semantic = st.checkbox("Semantic PII risk (Azure OpenAI)", value=False, help="GPT flags columns that look like PII but weren't caught by the scanner.")
+    run_regulatory = st.checkbox("Regulatory risk — HIPAA/GDPR/CCPA (Azure OpenAI)", value=False, help="GPT identifies columns that may trigger regulatory obligations.")
+    run_quasi = st.checkbox("Quasi-identifier detection (Azure OpenAI)", value=False, help="GPT identifies column combinations that together could re-identify individuals.")
+    run_format = st.checkbox("Format anomaly check (Azure OpenAI)", value=False, help="GPT checks whether values match the format implied by the column name.")
+
     st.header("Cloud Remediation")
     build_anonymized = st.checkbox("Generate cloud-ready files", value=True)
     remediation_mode = st.selectbox(
@@ -832,6 +867,9 @@ if run_clicked and input_files and run_scan:
     regulatory_flags: dict[str, list[RegulatoryFlag]] = {}
     quasi_groups: dict[str, list[QuasiIdentifierGroup]] = {}
     format_anomalies: dict[str, list[FormatAnomaly]] = {}
+    plausibility_issues: dict[str, list[PlausibilityIssue]] = {}
+    consistency_issues: dict[str, list[ConsistencyIssue]] = {}
+    completeness_issues: dict[str, list[CompletenessIssue]] = {}
 
     with st.spinner("Scanning files..."):
         for uploaded in input_files:
@@ -873,6 +911,15 @@ if run_clicked and input_files and run_scan:
 
                 if run_format:
                     format_anomalies[uploaded.name] = detect_format_anomalies(df)
+
+                if run_plausibility:
+                    plausibility_issues[uploaded.name] = assess_value_plausibility(df)
+
+                if run_consistency:
+                    consistency_issues[uploaded.name] = detect_consistency_violations(df)
+
+                if run_completeness:
+                    completeness_issues[uploaded.name] = assess_completeness(df)
 
                 if not include_presidio:
                     findings = [
@@ -1086,6 +1133,36 @@ if run_clicked and input_files and run_scan:
                         continue
                     st.markdown(f"**{fname}** — ⚠️ {len(anomalies)} format mismatch(es)")
                     rows = [{"column": a.column, "expected": a.expected_format, "issue": a.observed_issue, "severity": a.severity} for a in anomalies]
+                    st.dataframe(pd.DataFrame(rows), width="stretch")
+        if plausibility_issues:
+            any_p = any(plausibility_issues.values())
+            with st.expander("Value plausibility (AI)", expanded=any_p):
+                for fname, issues in plausibility_issues.items():
+                    if not issues:
+                        st.markdown(f"**{fname}** — ✅ all values appear plausible")
+                        continue
+                    st.markdown(f"**{fname}** — ⚠️ {len(issues)} plausibility issue(s)")
+                    rows = [{"column": i.column, "severity": i.severity, "issue": i.issue, "example": i.example} for i in issues]
+                    st.dataframe(pd.DataFrame(rows), width="stretch")
+        if consistency_issues:
+            any_c = any(consistency_issues.values())
+            with st.expander("Cross-column consistency (AI)", expanded=any_c):
+                for fname, issues in consistency_issues.items():
+                    if not issues:
+                        st.markdown(f"**{fname}** — ✅ no cross-column inconsistencies found")
+                        continue
+                    st.markdown(f"**{fname}** — ⚠️ {len(issues)} consistency issue(s)")
+                    rows = [{"columns": i.columns, "severity": i.severity, "issue": i.issue} for i in issues]
+                    st.dataframe(pd.DataFrame(rows), width="stretch")
+        if completeness_issues:
+            any_co = any(completeness_issues.values())
+            with st.expander("Completeness assessment (AI)", expanded=any_co):
+                for fname, issues in completeness_issues.items():
+                    if not issues:
+                        st.markdown(f"**{fname}** — ✅ dataset appears complete")
+                        continue
+                    st.markdown(f"**{fname}** — ⚠️ {len(issues)} completeness gap(s)")
+                    rows = [{"column": i.column, "severity": i.severity, "issue": i.issue} for i in issues]
                     st.dataframe(pd.DataFrame(rows), width="stretch")
         if dq_output_report:
             with st.expander("Scanner diagnostics (advanced)", expanded=not dq_output_report.passed):

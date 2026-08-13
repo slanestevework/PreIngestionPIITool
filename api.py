@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import json
 from io import BytesIO
 from pathlib import Path
 from typing import Any
@@ -62,13 +63,38 @@ def _scan_dataframe(df: pd.DataFrame, source_name: str) -> dict[str, Any]:
     }
 
 
+def _load_json_dataframe_from_bytes(payload: bytes) -> pd.DataFrame:
+    # Accept both JSONL and conventional JSON payloads.
+    text_content = payload.decode("utf-8-sig")
+
+    try:
+        parsed = json.loads(text_content)
+    except json.JSONDecodeError:
+        return pd.read_json(BytesIO(payload), lines=True)
+
+    if isinstance(parsed, list):
+        return pd.json_normalize(parsed)
+
+    if isinstance(parsed, dict):
+        for list_key in ("records", "items", "data", "teas"):
+            candidate = parsed.get(list_key)
+            if isinstance(candidate, list):
+                return pd.json_normalize(candidate)
+        return pd.json_normalize([parsed])
+
+    raise HTTPException(
+        status_code=400,
+        detail="Unsupported JSON structure. Expected object, array, or JSON lines.",
+    )
+
+
 def _load_dataframe_from_upload(upload_file: UploadFile, payload: bytes) -> pd.DataFrame:
     extension = Path(upload_file.filename or "").suffix.lower().lstrip(".")
 
     if extension == "csv":
         return pd.read_csv(BytesIO(payload), dtype=str)
     if extension == "json":
-        return pd.read_json(BytesIO(payload), lines=True)
+        return _load_json_dataframe_from_bytes(payload)
     if extension == "parquet":
         return pd.read_parquet(BytesIO(payload))
     if extension == "txt":
