@@ -56,6 +56,11 @@ from ._dq_intelligence import (
     detect_consistency_violations,
     assess_completeness,
 )
+from ._expectation_autogen import (
+    AutoExpectationSpec,
+    AutoExpectationRun,
+    run_auto_expectations,
+)
 
 __all__ = [
     "validate_input",
@@ -79,6 +84,9 @@ __all__ = [
     "ConsistencyIssue",
     "assess_completeness",
     "CompletenessIssue",
+    "AutoExpectationSpec",
+    "AutoExpectationRun",
+    "run_auto_expectations",
 ]
 
 

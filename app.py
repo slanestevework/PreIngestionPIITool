@@ -33,6 +33,8 @@ from data_quality import (
     ConsistencyIssue,
     assess_completeness,
     CompletenessIssue,
+    AutoExpectationRun,
+    run_auto_expectations,
 )
 from patterns import PII_REGEXES
 from scanner import analyzer as presidio_analyzer
@@ -773,6 +775,12 @@ with st.sidebar:
     run_plausibility = st.checkbox("Value plausibility (Azure OpenAI)", value=False, disabled=not run_dq, help="GPT checks whether individual values make sense for their column.")
     run_consistency = st.checkbox("Cross-column consistency (Azure OpenAI)", value=False, disabled=not run_dq, help="GPT checks for contradictions between columns (e.g. end date before start date).")
     run_completeness = st.checkbox("Completeness assessment (Azure OpenAI)", value=False, disabled=not run_dq, help="GPT identifies columns that appear incomplete or companion columns that are missing.")
+    run_auto_dq_expectations = st.checkbox(
+        "Auto-generate expectations (Azure OpenAI)",
+        value=False,
+        disabled=not run_dq,
+        help="GPT proposes additional Great Expectations checks from data profiling and validates them.",
+    )
 
     st.header("AI — PII & Compliance")
     run_semantic = st.checkbox("Semantic PII risk (Azure OpenAI)", value=False, help="GPT flags columns that look like PII but weren't caught by the scanner.")
@@ -870,6 +878,7 @@ if run_clicked and input_files and run_scan:
     plausibility_issues: dict[str, list[PlausibilityIssue]] = {}
     consistency_issues: dict[str, list[ConsistencyIssue]] = {}
     completeness_issues: dict[str, list[CompletenessIssue]] = {}
+    auto_expectation_runs: dict[str, AutoExpectationRun] = {}
 
     with st.spinner("Scanning files..."):
         for uploaded in input_files:
@@ -920,6 +929,12 @@ if run_clicked and input_files and run_scan:
 
                 if run_completeness:
                     completeness_issues[uploaded.name] = assess_completeness(df)
+
+                if run_auto_dq_expectations:
+                    auto_expectation_runs[uploaded.name] = run_auto_expectations(
+                        df,
+                        suite_name=f"auto_dq_{Path(uploaded.name).stem}",
+                    )
 
                 if not include_presidio:
                     findings = [
@@ -1164,6 +1179,49 @@ if run_clicked and input_files and run_scan:
                     st.markdown(f"**{fname}** — ⚠️ {len(issues)} completeness gap(s)")
                     rows = [{"column": i.column, "severity": i.severity, "issue": i.issue} for i in issues]
                     st.dataframe(pd.DataFrame(rows), width="stretch")
+        if auto_expectation_runs:
+            any_failed = any(
+                run.report is not None and not run.report.passed
+                for run in auto_expectation_runs.values()
+            )
+            with st.expander("AI-generated expectations (preview)", expanded=any_failed):
+                for fname, auto_run in auto_expectation_runs.items():
+                    if auto_run.error:
+                        st.markdown(f"**{fname}** — ⚠️ unable to generate expectations")
+                        st.warning(auto_run.error)
+                        continue
+
+                    report = auto_run.report
+                    if report is None:
+                        st.markdown(f"**{fname}** — ⚠️ no generated expectations")
+                        continue
+
+                    status = "✅ passed" if report.passed else "❌ failed"
+                    st.markdown(
+                        f"**{fname}** — {status} ({report.successful}/{report.evaluated} checks)"
+                    )
+
+                    if auto_run.specs:
+                        spec_rows = [
+                            {
+                                "expectation": s.expectation_type,
+                                "column": s.column,
+                                "params": json.dumps(s.kwargs, ensure_ascii=False),
+                                "confidence": s.confidence,
+                                "rationale": s.rationale,
+                            }
+                            for s in auto_run.specs
+                        ]
+                        st.caption("Expectations proposed by AI")
+                        st.dataframe(pd.DataFrame(spec_rows), width="stretch")
+
+                    if report.failures:
+                        failure_rows = [
+                            {"issue": f.expectation, "column": f.column or "", **f.details}
+                            for f in report.failures
+                        ]
+                        st.caption("Validation results for generated expectations")
+                        st.dataframe(pd.DataFrame(failure_rows), width="stretch")
         if dq_output_report:
             with st.expander("Scanner diagnostics (advanced)", expanded=not dq_output_report.passed):
                 status = "✅ passed" if dq_output_report.passed else "❌ failed"
