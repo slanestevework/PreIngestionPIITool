@@ -11,6 +11,55 @@ from ._llm import chat
 from ._report import DQReport, build_report
 from ._runner import run_expectations
 
+
+def _human_expectation_label(expectation_type: str) -> str:
+    labels = {
+        "expect_column_values_to_not_be_null": "Column has too many nulls",
+        "expect_column_values_to_be_unique": "Column values must be unique",
+        "expect_column_values_to_be_between": "Column values out of allowed range",
+        "expect_column_values_to_be_in_set": "Column contains unexpected values",
+        "expect_column_values_to_match_regex": "Column value format mismatch",
+        "expect_column_value_lengths_to_be_between": "Column value length out of range",
+    }
+    key = expectation_type.lower().strip()
+    return labels.get(key, key.removeprefix("expect_").replace("_", " ").title())
+
+
+def _format_failure_details(expectation_type: str, raw: dict[str, Any]) -> dict[str, str]:
+    key = expectation_type.lower()
+    out: dict[str, str] = {}
+
+    if "not_be_null" in key:
+        out["why_failed"] = "Too many null or blank values were found."
+        out["null_count"] = str(raw.get("unexpected_count", ""))
+        pct = raw.get("unexpected_percent")
+        if pct is not None:
+            out["null_pct"] = f"{float(pct):.1f}%"
+    elif "to_be_in_set" in key:
+        out["why_failed"] = "Values outside the approved set were found."
+        out["bad_values"] = str(raw.get("partial_unexpected_list", ""))
+        out["bad_count"] = str(raw.get("unexpected_count", ""))
+    elif "to_be_between" in key:
+        out["why_failed"] = "Values outside the configured numeric range were found."
+        out["observed"] = str(raw.get("observed_value", ""))
+        out["bad_count"] = str(raw.get("unexpected_count", ""))
+    elif "to_match_regex" in key:
+        out["why_failed"] = "Values did not match the expected text format pattern."
+        out["bad_values"] = str(raw.get("partial_unexpected_list", ""))
+        out["bad_count"] = str(raw.get("unexpected_count", ""))
+    elif "lengths_to_be_between" in key:
+        out["why_failed"] = "Value lengths fell outside the expected range."
+        out["bad_values"] = str(raw.get("partial_unexpected_list", ""))
+        out["bad_count"] = str(raw.get("unexpected_count", ""))
+    elif "to_be_unique" in key:
+        out["why_failed"] = "Duplicate values were found where uniqueness was expected."
+        out["duplicate_count"] = str(raw.get("unexpected_count", ""))
+        out["sample_duplicates"] = str(raw.get("partial_unexpected_list", ""))
+    else:
+        out["why_failed"] = "Expectation did not pass validation."
+
+    return {k: v for k, v in out.items() if v not in {"", "None"}}
+
 _EXPECTATION_SYSTEM = (
     "You are a Great Expectations assistant for tabular data quality. "
     "Given a compact profile of a dataset, propose practical expectations as JSON only. "
@@ -64,23 +113,36 @@ class AutoExpectationSpec:
 @dataclass
 class AutoExpectationRun:
     specs: list[AutoExpectationSpec]
+    outcomes: list[dict[str, Any]]
     report: DQReport | None
     error: str | None = None
+    diagnostic: dict[str, Any] | None = None
 
 
 def _to_json_clean(raw: str) -> list[dict[str, Any]]:
     text = raw.strip()
-    text = text.removeprefix("```json").removeprefix("```").removesuffix("```").strip()
+    # Strip any markdown code fence regardless of language label case
+    import re as _re
+    text = _re.sub(r"^```[a-zA-Z]*\s*", "", text)
+    text = _re.sub(r"\s*```$", "", text).strip()
     try:
         parsed = json.loads(text)
     except (json.JSONDecodeError, ValueError):
         return []
+    # LLM sometimes wraps array in an object with a key
+    if isinstance(parsed, dict):
+        for key in ("expectations", "items", "results", "data", "checks"):
+            if isinstance(parsed.get(key), list):
+                parsed = parsed[key]
+                break
+        else:
+            return []
     if not isinstance(parsed, list):
         return []
     return [item for item in parsed if isinstance(item, dict)]
 
 
-def _col_profile(series: pd.Series) -> dict[str, Any]:
+def _col_profile(series: pd.Series, max_samples: int = 5, max_top: int = 8) -> dict[str, Any]:
     non_null = series.dropna()
     non_null_count = int(non_null.shape[0])
 
@@ -93,7 +155,7 @@ def _col_profile(series: pd.Series) -> dict[str, Any]:
         "distinct_pct": round(float(non_null.nunique(dropna=True) / non_null_count * 100), 2)
         if non_null_count
         else 0.0,
-        "sample_values": non_null.astype(str).head(8).tolist(),
+        "sample_values": non_null.astype(str).head(max_samples).tolist(),
     }
 
     if non_null_count and pd.api.types.is_numeric_dtype(series):
@@ -118,21 +180,41 @@ def _col_profile(series: pd.Series) -> dict[str, Any]:
                 "len_p95": float(lengths.quantile(0.95)),
             }
         )
-        top = as_text.value_counts(dropna=True).head(12)
+        top = as_text.value_counts(dropna=True).head(max_top)
         if not top.empty:
-            profile["top_values"] = {str(k): int(v) for k, v in top.items()}
+            # Only include top_values when cardinality is low enough to be meaningful
+            if non_null.nunique() <= 50:
+                profile["top_values"] = {str(k): int(v) for k, v in top.items()}
 
     return profile
 
 
-def _dataset_profile(df: pd.DataFrame, max_columns: int = 40) -> dict[str, Any]:
+def _dataset_profile(df: pd.DataFrame, max_columns: int = 25, max_samples: int = 5, max_top: int = 8) -> dict[str, Any]:
     selected_columns = list(df.columns)[:max_columns]
     return {
         "row_count": int(df.shape[0]),
         "column_count": int(df.shape[1]),
         "columns": {
-            str(col): _col_profile(df[col])
+            str(col): _col_profile(df[col], max_samples=max_samples, max_top=max_top)
             for col in selected_columns
+        },
+    }
+
+
+def _batch_profile(
+    df: pd.DataFrame,
+    columns: list,
+    max_samples: int = 5,
+    max_top: int = 8,
+) -> dict[str, Any]:
+    """Profile for a column subset — tells the LLM the full dataset size for context."""
+    return {
+        "row_count": int(df.shape[0]),
+        "total_columns": int(df.shape[1]),
+        "batch_columns": len(columns),
+        "columns": {
+            str(col): _col_profile(df[col], max_samples=max_samples, max_top=max_top)
+            for col in columns
         },
     }
 
@@ -240,15 +322,154 @@ def _build_gx_expectations(specs: list[AutoExpectationSpec]) -> list:
     return expectations
 
 
+def _build_outcomes(specs: list[AutoExpectationSpec], validation_result) -> list[dict[str, Any]]:
+    outcomes: list[dict[str, Any]] = []
+    raw_results = list(getattr(validation_result, "results", []) or [])
+
+    for idx, spec in enumerate(specs):
+        passed = None
+        failure_details: dict[str, str] = {}
+
+        if idx < len(raw_results):
+            result = raw_results[idx]
+            passed = bool(result.success)
+            if not passed:
+                failure_details = _format_failure_details(
+                    spec.expectation_type,
+                    result.result or {},
+                )
+
+        outcomes.append(
+            {
+                "index": idx + 1,
+                "expectation": spec.expectation_type,
+                "expectation_label": _human_expectation_label(spec.expectation_type),
+                "column": spec.column,
+                "params": spec.kwargs,
+                "confidence": spec.confidence,
+                "rationale": spec.rationale,
+                "passed": passed,
+                "status": "PASS" if passed else "FAIL",
+                "status_icon": "✅" if passed else "❌",
+                "failure_details": failure_details,
+            }
+        )
+
+    return outcomes
+
+
 def run_auto_expectations(df: pd.DataFrame, suite_name: str | None = None) -> AutoExpectationRun:
     try:
-        specs = propose_auto_expectation_specs(df)
+        total_chars, finish_reasons, llm_parsed, specs = _propose_with_diagnostics(df)
+        allowed_columns = {str(c) for c in df.columns}
+        n_batches = max(1, -(-len(df.columns) // _BATCH_SIZE))  # ceil division
+
+        rejected_type = sum(
+            1 for item in llm_parsed
+            if str(item.get("expectation_type", "")).strip().lower() not in _ALLOWED_TYPES
+        )
+        rejected_col = sum(
+            1 for item in llm_parsed
+            if str(item.get("expectation_type", "")).strip().lower() in _ALLOWED_TYPES
+            and str(item.get("column", "")).strip() not in allowed_columns
+        )
+
+        diag: dict[str, Any] = {
+            "batches": n_batches,
+            "llm_response_chars": total_chars,
+            "llm_finish_reasons": finish_reasons,
+            "llm_items_parsed": len(llm_parsed),
+            "specs_accepted": len(specs),
+            "rejected_unknown_type": rejected_type,
+            "rejected_bad_column": rejected_col,
+        }
+        any_truncated = "length" in finish_reasons
+        any_empty = total_chars == 0
+        if not llm_parsed:
+            diag["hint"] = (
+                ("One or more batches were truncated — response was empty." if any_truncated
+                 else "LLM returned no parseable JSON items.")
+                + (" Possible content filter or token limit." if any_empty else "")
+            )
+        elif not specs:
+            diag["hint"] = (
+                f"LLM returned {len(llm_parsed)} item(s) across {n_batches} batch(es) "
+                f"but all were rejected. Bad type: {rejected_type}, "
+                f"unrecognised column: {rejected_col}."
+            )
+
         gx_expectations = _build_gx_expectations(specs)
         if not gx_expectations:
-            return AutoExpectationRun(specs=specs, report=None, error="No valid expectations were generated.")
+            reason = "No valid expectations were generated for this file."
+            if specs:
+                reason = (
+                    f"{len(specs)} spec(s) were proposed but none could be converted "
+                    "to Great Expectations objects — kwargs may be invalid."
+                )
+            return AutoExpectationRun(
+                specs=specs, outcomes=[], report=None, error=reason, diagnostic=diag
+            )
 
         result = run_expectations(df, gx_expectations, suite_name=suite_name)
         report = build_report(result)
-        return AutoExpectationRun(specs=specs, report=report)
+        outcomes = _build_outcomes(specs, result)
+        return AutoExpectationRun(specs=specs, outcomes=outcomes, report=report, diagnostic=diag)
     except Exception as exc:
-        return AutoExpectationRun(specs=[], report=None, error=str(exc))
+        return AutoExpectationRun(
+            specs=[], outcomes=[], report=None, error=str(exc),
+            diagnostic={"hint": "Exception raised before diagnostics were collected."},
+        )
+
+
+_BATCH_SIZE = 8  # columns per LLM call
+
+
+def _propose_with_diagnostics(
+    df: pd.DataFrame,
+) -> tuple[int, list[str], list[dict[str, Any]], list[AutoExpectationSpec]]:
+    """Batches columns, makes one LLM call per batch, merges specs.
+
+    Returns (total_chars, finish_reasons, all_parsed_items, accepted_specs).
+    """
+    if df.empty:
+        return 0, [], [], []
+
+    all_columns = list(df.columns)
+    batches = [all_columns[i:i + _BATCH_SIZE] for i in range(0, len(all_columns), _BATCH_SIZE)]
+    allowed_columns = {str(c) for c in all_columns}
+
+    total_chars = 0
+    finish_reasons: list[str] = []
+    all_parsed: list[dict[str, Any]] = []
+    specs: list[AutoExpectationSpec] = []
+    seen: set[tuple[str, str, str]] = set()
+
+    for batch_cols in batches:
+        profile_json = json.dumps(_batch_profile(df, batch_cols), ensure_ascii=False)
+        raw, finish_reason = chat(_EXPECTATION_SYSTEM, profile_json, max_tokens=1200)
+
+        # Retry this batch with fewer samples if truncated or empty
+        if not raw.strip() or finish_reason == "length":
+            profile_json = json.dumps(_batch_profile(df, batch_cols, max_samples=3, max_top=5), ensure_ascii=False)
+            raw, finish_reason = chat(_EXPECTATION_SYSTEM, profile_json, max_tokens=1200)
+
+        total_chars += len(raw)
+        finish_reasons.append(finish_reason)
+        parsed = _to_json_clean(raw)
+        all_parsed.extend(parsed)
+
+        for item in parsed:
+            spec = _sanitize_spec(item, allowed_columns)
+            if spec is None:
+                continue
+            dedupe_key = (
+                spec.expectation_type,
+                spec.column,
+                json.dumps(spec.kwargs, sort_keys=True, default=str),
+            )
+            if dedupe_key in seen:
+                continue
+            seen.add(dedupe_key)
+            specs.append(spec)
+
+    return total_chars, finish_reasons, all_parsed, specs

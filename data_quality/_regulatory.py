@@ -94,7 +94,7 @@ def assess_regulatory_risk(df: pd.DataFrame) -> list[RegulatoryFlag]:
     if df.empty:
         return []
     payload = json.dumps(_sample_payload(df), ensure_ascii=False)
-    items = _parse_json(chat(_REGULATORY_SYSTEM, payload, max_tokens=768))
+    items = _parse_json(chat(_REGULATORY_SYSTEM, payload, max_tokens=768)[0])
     return [
         RegulatoryFlag(
             column=str(item.get("column", "")),
@@ -113,7 +113,7 @@ def detect_quasi_identifiers(df: pd.DataFrame) -> list[QuasiIdentifierGroup]:
     if df.empty or len(df.columns) < 2:
         return []
     payload = json.dumps(_sample_payload(df), ensure_ascii=False)
-    items = _parse_json(chat(_QUASI_SYSTEM, payload, max_tokens=512))
+    items = _parse_json(chat(_QUASI_SYSTEM, payload, max_tokens=512)[0])
     return [
         QuasiIdentifierGroup(
             columns=item.get("columns", []),
@@ -130,7 +130,7 @@ def detect_format_anomalies(df: pd.DataFrame) -> list[FormatAnomaly]:
     if df.empty:
         return []
     payload = json.dumps(_sample_payload(df), ensure_ascii=False)
-    items = _parse_json(chat(_FORMAT_SYSTEM, payload, max_tokens=512))
+    items = _parse_json(chat(_FORMAT_SYSTEM, payload, max_tokens=512)[0])
     return [
         FormatAnomaly(
             column=str(item.get("column", "")),

@@ -37,8 +37,8 @@ def get_client() -> AzureOpenAI:
     )
 
 
-def chat(system: str, user: str, deployment: str | None = None, max_tokens: int = 512) -> str:
-    """Sends a single chat completion request and returns the response text."""
+def chat(system: str, user: str, deployment: str | None = None, max_tokens: int = 512) -> tuple[str, str]:
+    """Returns (response_text, finish_reason). finish_reason is 'stop', 'length', 'content_filter', etc."""
     model = deployment or os.environ.get("AZURE_OPENAI_DEPLOYMENT", "gpt-4o")
     client = get_client()
     response = client.chat.completions.create(
@@ -49,4 +49,5 @@ def chat(system: str, user: str, deployment: str | None = None, max_tokens: int 
         ],
         max_completion_tokens=max_tokens,
     )
-    return response.choices[0].message.content or ""
+    choice = response.choices[0]
+    return choice.message.content or "", choice.finish_reason or "unknown"

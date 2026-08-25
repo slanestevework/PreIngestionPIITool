@@ -94,7 +94,7 @@ def assess_value_plausibility(df: pd.DataFrame) -> list[PlausibilityIssue]:
     """LLM checks whether individual values are plausible for their column."""
     if df.empty:
         return []
-    raw = chat(_PLAUSIBILITY_SYSTEM, json.dumps(_sample_payload(df), ensure_ascii=False), max_tokens=512)
+    raw, _ = chat(_PLAUSIBILITY_SYSTEM, json.dumps(_sample_payload(df), ensure_ascii=False), max_tokens=512)
     return [
         PlausibilityIssue(
             column=str(item.get("column", "")),
@@ -111,7 +111,7 @@ def detect_consistency_violations(df: pd.DataFrame) -> list[ConsistencyIssue]:
     """LLM checks for cross-column inconsistencies (date order, zip/state, totals, etc.)."""
     if df.empty or len(df.columns) < 2:
         return []
-    raw = chat(_CONSISTENCY_SYSTEM, json.dumps(_sample_payload(df), ensure_ascii=False), max_tokens=512)
+    raw, _ = chat(_CONSISTENCY_SYSTEM, json.dumps(_sample_payload(df), ensure_ascii=False), max_tokens=512)
     return [
         ConsistencyIssue(
             columns=str(item.get("columns", "")),
@@ -127,7 +127,7 @@ def assess_completeness(df: pd.DataFrame) -> list[CompletenessIssue]:
     """LLM identifies columns that look incomplete or companion columns that appear missing."""
     if df.empty:
         return []
-    raw = chat(_COMPLETENESS_SYSTEM, json.dumps(_sample_payload(df), ensure_ascii=False), max_tokens=512)
+    raw, _ = chat(_COMPLETENESS_SYSTEM, json.dumps(_sample_payload(df), ensure_ascii=False), max_tokens=512)
     return [
         CompletenessIssue(
             column=str(item.get("column", "")),

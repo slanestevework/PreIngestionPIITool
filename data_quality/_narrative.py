@@ -38,4 +38,5 @@ def generate_narrative(report: DQReport, file_name: str = "") -> str:
         f"Failures:\n{json.dumps(failures_payload, indent=2)}"
     )
 
-    return chat(_SYSTEM, user_msg, max_tokens=256)
+    text, _ = chat(_SYSTEM, user_msg, max_tokens=256)
+    return text

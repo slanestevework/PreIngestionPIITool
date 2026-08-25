@@ -11,7 +11,21 @@ from fastapi import Depends, FastAPI, File, Header, HTTPException, UploadFile
 from pydantic import BaseModel, Field
 
 from scanner import scan_dataframe
-from data_quality import DQReport, validate_input
+from data_quality import (
+    DQReport,
+    validate_input,
+    detect_anomalies,
+    generate_narrative,
+    assess_semantic_pii_risk,
+    assess_regulatory_risk,
+    detect_quasi_identifiers,
+    detect_format_anomalies,
+    assess_value_plausibility,
+    detect_consistency_violations,
+    assess_completeness,
+    run_auto_expectations,
+)
+from remediate import remediate_dataframe, RemediationRecord
 
 
 class ScanRecordsRequest(BaseModel):
@@ -190,3 +204,244 @@ async def quality_validate_file(file: UploadFile = File(...)) -> dict:
 
     report: DQReport = validate_input(df)
     return report.to_dict()
+
+
+@app.post("/quality/ai-analysis/file", dependencies=[Depends(_require_api_key)])
+async def quality_ai_analysis_file(
+    file: UploadFile = File(...),
+    narrative: bool = False,
+    anomaly: bool = False,
+    semantic_pii: bool = False,
+    regulatory: bool = False,
+    quasi_id: bool = False,
+    format_check: bool = False,
+    plausibility: bool = False,
+    consistency: bool = False,
+    completeness: bool = False,
+    auto_expectations: bool = False,
+) -> dict[str, Any]:
+    """Run AI-powered DQ checks (Azure OpenAI + Isolation Forest) on an uploaded file."""
+    extension = Path(file.filename or "").suffix.lower().lstrip(".")
+    if extension not in SUPPORTED_EXTENSIONS:
+        raise HTTPException(status_code=400, detail="Unsupported file type.")
+
+    payload = await file.read()
+    if not payload:
+        raise HTTPException(status_code=400, detail="Uploaded file is empty")
+
+    try:
+        df = _load_dataframe_from_upload(file, payload)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    source_name = file.filename or "uploaded_file"
+    result: dict[str, Any] = {"source": source_name, "checks_run": [], "errors": {}}
+
+    # Narrative requires a DQ report first
+    dq_report: DQReport | None = None
+    if narrative:
+        try:
+            dq_report = validate_input(df)
+            result["narrative"] = generate_narrative(dq_report, file_name=source_name)
+            result["checks_run"].append("narrative")
+        except Exception as exc:
+            result["errors"]["narrative"] = str(exc)
+
+    if anomaly:
+        try:
+            anomaly_results = detect_anomalies(df)
+            result["anomalies"] = [
+                {
+                    "column": a.column,
+                    "anomalous_row_count": a.anomalous_row_count,
+                    "total_rows": a.total_rows,
+                    "anomaly_pct": a.anomaly_pct,
+                    "explanation": a.explanation,
+                    "sample_anomalous_values": a.sample_anomalous_values,
+                }
+                for a in anomaly_results if a.flagged
+            ]
+            result["checks_run"].append("anomaly")
+        except Exception as exc:
+            result["errors"]["anomaly"] = str(exc)
+
+    if semantic_pii:
+        try:
+            risks = assess_semantic_pii_risk(df)
+            result["semantic_pii_risks"] = [
+                {"column": r.column, "risk": r.risk, "reason": r.reason} for r in risks
+            ]
+            result["checks_run"].append("semantic_pii")
+        except Exception as exc:
+            result["errors"]["semantic_pii"] = str(exc)
+
+    if regulatory:
+        try:
+            flags = assess_regulatory_risk(df)
+            result["regulatory_flags"] = [
+                {
+                    "column": f.column,
+                    "regulation": f.regulation,
+                    "category": f.category,
+                    "obligation": f.obligation,
+                    "severity": f.severity,
+                }
+                for f in flags
+            ]
+            result["checks_run"].append("regulatory")
+        except Exception as exc:
+            result["errors"]["regulatory"] = str(exc)
+
+    if quasi_id:
+        try:
+            groups = detect_quasi_identifiers(df)
+            result["quasi_identifiers"] = [
+                {"columns": g.columns, "risk": g.risk, "reason": g.reason} for g in groups
+            ]
+            result["checks_run"].append("quasi_id")
+        except Exception as exc:
+            result["errors"]["quasi_id"] = str(exc)
+
+    if format_check:
+        try:
+            anomalies = detect_format_anomalies(df)
+            result["format_anomalies"] = [
+                {
+                    "column": a.column,
+                    "expected_format": a.expected_format,
+                    "observed_issue": a.observed_issue,
+                    "severity": a.severity,
+                }
+                for a in anomalies
+            ]
+            result["checks_run"].append("format_check")
+        except Exception as exc:
+            result["errors"]["format_check"] = str(exc)
+
+    if plausibility:
+        try:
+            issues = assess_value_plausibility(df)
+            result["plausibility_issues"] = [
+                {"column": i.column, "issue": i.issue, "example": i.example, "severity": i.severity}
+                for i in issues
+            ]
+            result["checks_run"].append("plausibility")
+        except Exception as exc:
+            result["errors"]["plausibility"] = str(exc)
+
+    if consistency:
+        try:
+            issues = detect_consistency_violations(df)
+            result["consistency_issues"] = [
+                {"columns": i.columns, "issue": i.issue, "severity": i.severity} for i in issues
+            ]
+            result["checks_run"].append("consistency")
+        except Exception as exc:
+            result["errors"]["consistency"] = str(exc)
+
+    if completeness:
+        try:
+            issues = assess_completeness(df)
+            result["completeness_issues"] = [
+                {"column": i.column, "issue": i.issue, "severity": i.severity} for i in issues
+            ]
+            result["checks_run"].append("completeness")
+        except Exception as exc:
+            result["errors"]["completeness"] = str(exc)
+
+    if auto_expectations:
+        # run_auto_expectations catches its own exceptions internally
+        auto_run = run_auto_expectations(df)
+        result["auto_expectations"] = {
+            "proposed_count": len(auto_run.specs),
+            "executed_count": len(auto_run.outcomes),   # distinct from passed — means "run"
+            "error": auto_run.error,
+            "diagnostic": auto_run.diagnostic,
+            "passed": auto_run.report.successful if auto_run.report else 0,
+            "failed": auto_run.report.failed if auto_run.report else 0,
+            "success_rate": auto_run.report.success_rate if auto_run.report else 0.0,
+            "failures": (
+                [
+                    {"expectation": f.expectation, "column": f.column, "details": f.details}
+                    for f in auto_run.report.failures
+                ]
+                if auto_run.report else []
+            ),
+            "specs": [
+                {
+                    "expectation_type": s.expectation_type,
+                    "column": s.column,
+                    "confidence": s.confidence,
+                    "rationale": s.rationale,
+                }
+                for s in auto_run.specs
+            ],
+            "outcomes": auto_run.outcomes,
+        }
+        result["checks_run"].append("auto_expectations")
+
+    return result
+
+
+@app.post("/remediate/file", dependencies=[Depends(_require_api_key)])
+async def remediate_file(
+    file: UploadFile = File(...),
+    mode: str = "redact",
+    salt: str = "api-remediation-salt",
+    include_review: bool = True,
+) -> dict[str, Any]:
+    """Scan a file for PII and return a remediated CSV plus a remediation summary."""
+    extension = Path(file.filename or "").suffix.lower().lstrip(".")
+    if extension not in SUPPORTED_EXTENSIONS:
+        raise HTTPException(
+            status_code=400,
+            detail="Unsupported file type. Use csv, json, parquet, txt, xlsx, or xls.",
+        )
+    if mode not in {"redact", "mask_last4", "hash"}:
+        raise HTTPException(status_code=400, detail="mode must be redact, mask_last4, or hash")
+
+    payload = await file.read()
+    if not payload:
+        raise HTTPException(status_code=400, detail="Uploaded file is empty")
+
+    try:
+        df = _load_dataframe_from_upload(file, payload)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    source_name = file.filename or "uploaded_file"
+    findings, stats = scan_dataframe(df=df, source_name=source_name)
+    findings_df = pd.DataFrame(findings) if findings else pd.DataFrame()
+
+    remediated_df, records = remediate_dataframe(
+        file_name=source_name,
+        df=df,
+        findings_df=findings_df,
+        remediation_mode=mode,
+        include_review_findings=include_review,
+        hash_salt=salt,
+        strict_person_fallback=True,
+        strict_location_fallback=True,
+        strict_common_fallback=True,
+        strict_date_fallback=True,
+        selected_patterns=None,
+    )
+
+    return {
+        "source": source_name,
+        "mode": mode,
+        "scan_stats": stats,
+        "pii_findings_count": len(findings),
+        "remediation_summary": [
+            {
+                "column": r.column,
+                "pattern": r.pattern,
+                "detection_source": r.detection_source,
+                "strategy": r.strategy,
+                "cells_changed": r.cells_changed,
+            }
+            for r in records
+        ],
+        "total_cells_changed": sum(r.cells_changed for r in records),
+        "remediated_csv": remediated_df.to_csv(index=False),
+    }

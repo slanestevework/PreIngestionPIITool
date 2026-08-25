@@ -56,7 +56,7 @@ def assess_semantic_pii_risk(
 
     user_msg = json.dumps(samples, ensure_ascii=False)
 
-    raw = chat(_SYSTEM, user_msg, max_tokens=512)
+    raw, _ = chat(_SYSTEM, user_msg, max_tokens=512)
 
     # Strip markdown fences if the model wraps the JSON
     cleaned = raw.strip().removeprefix("```json").removeprefix("```").removesuffix("```").strip()
