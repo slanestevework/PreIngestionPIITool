@@ -1,0 +1,81 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: pii-scanner-api
+  labels:
+    app: pii-scanner-api
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: pii-scanner-api
+  template:
+    metadata:
+      labels:
+        app: pii-scanner-api
+    spec:
+      containers:
+      - name: api
+        image: image-registry.openshift-image-registry.svc:5000/${NAMESPACE}/pii-scanner-api:latest
+        imagePullPolicy: Always
+        ports:
+        - containerPort: 8000
+          name: http
+        env:
+        - name: PII_SCANNER_API_KEY
+          valueFrom:
+            secretKeyRef:
+              name: pii-scanner-secret
+              key: api-key
+        readinessProbe:
+          httpGet:
+            path: /health
+            port: http
+          initialDelaySeconds: 10
+          periodSeconds: 10
+          timeoutSeconds: 2
+          failureThreshold: 6
+        livenessProbe:
+          httpGet:
+            path: /health
+            port: http
+          initialDelaySeconds: 30
+          periodSeconds: 20
+          timeoutSeconds: 2
+          failureThreshold: 3
+        resources:
+          requests:
+            cpu: 250m
+            memory: 1Gi
+          limits:
+            cpu: "1"
+            memory: 2Gi
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: pii-scanner-api
+  labels:
+    app: pii-scanner-api
+spec:
+  selector:
+    app: pii-scanner-api
+  ports:
+  - name: http
+    port: 80
+    targetPort: http
+---
+apiVersion: route.openshift.io/v1
+kind: Route
+metadata:
+  name: pii-scanner-api
+  labels:
+    app: pii-scanner-api
+spec:
+  to:
+    kind: Service
+    name: pii-scanner-api
+  port:
+    targetPort: http
+  tls:
+    termination: edge

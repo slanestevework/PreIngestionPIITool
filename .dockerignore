@@ -1,0 +1,22 @@
+.git
+.github
+.venv
+__pycache__
+*.pyc
+*.pyo
+*.pyd
+.pytest_cache
+.mypy_cache
+.vscode
+*.ipynb
+
+# Local outputs
+pii_findings.csv
+pii_stats.csv
+
+# Local env/config
+.env
+
+# Optional docs and presentation artifacts can be excluded from runtime image.
+PRESENTATION_CONTENT.md
+AI_USAGE_REPORT_PII_DQ.md
