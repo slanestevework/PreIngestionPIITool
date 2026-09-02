@@ -9,7 +9,7 @@ from typing import Any, Hashable
 import pandas as pd
 
 from patterns import PII_REGEXES
-from scanner import analyzer as presidio_analyzer
+from scanner import get_analyzer
 
 # ---------------------------------------------------------------------------
 # Constants
@@ -193,6 +193,10 @@ def replace_by_presidio_entity(
     strict_person_fallback: bool,
     strict_location_fallback: bool,
 ) -> tuple[pd.Series, int]:
+    analyzer = get_analyzer()
+    if analyzer is None:
+        return series, 0
+
     updated_values = []
     changed = 0
     for original in series.astype(str):
@@ -201,7 +205,7 @@ def replace_by_presidio_entity(
             value = apply_person_context_fallback(value, column_name, remediation_mode, salt)
         if entity_type == "LOCATION" and strict_location_fallback:
             value = apply_location_context_fallback(value, remediation_mode, salt)
-        entities = presidio_analyzer.analyze(text=value, language="en")
+        entities = analyzer.analyze(text=value, language="en")
         target_entities = [e for e in entities if e.entity_type == entity_type]
         for entity in sorted(target_entities, key=lambda x: x.start, reverse=True):
             detected_text = value[entity.start:entity.end]
