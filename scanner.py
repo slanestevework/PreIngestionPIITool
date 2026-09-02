@@ -4,8 +4,40 @@ import json
 import pandas as pd
 from patterns import (PII_NAME_HINTS, PII_REGEXES, COLUMN_PATTERN_MAP, HIGH_RISK_PATTERNS)
 from presidio_analyzer import AnalyzerEngine
+from presidio_analyzer.nlp_engine import NlpEngineProvider
 
-analyzer = AnalyzerEngine()
+_ANALYZER: AnalyzerEngine | None = None
+_ANALYZER_INIT_FAILED = False
+
+
+def get_analyzer() -> AnalyzerEngine | None:
+    global _ANALYZER, _ANALYZER_INIT_FAILED
+
+    if _ANALYZER_INIT_FAILED:
+        return None
+
+    if _ANALYZER is not None:
+        return _ANALYZER
+
+    try:
+        nlp_configuration = {
+            "nlp_engine_name": "spacy",
+            "models": [
+                {
+                    "lang_code": "en",
+                    "model_name": "en_core_web_sm",
+                }
+            ],
+        }
+        provider = NlpEngineProvider(nlp_configuration=nlp_configuration)
+        nlp_engine = provider.create_engine()
+        _ANALYZER = AnalyzerEngine(nlp_engine=nlp_engine, supported_languages=["en"])
+        return _ANALYZER
+    except Exception as exc:
+        # Keep API alive even when NLP model dependencies are unavailable.
+        print(f"Presidio analyzer initialization failed: {exc}")
+        _ANALYZER_INIT_FAILED = True
+        return None
 
 
 SAMPLE_LIMIT = 500
@@ -49,6 +81,10 @@ def _load_json_dataframe_from_path(file_path: str) -> pd.DataFrame:
     raise ValueError("Unsupported JSON structure. Expected object, array, or JSON lines.")
 
 def presidio_scan(values):
+
+    analyzer = get_analyzer()
+    if analyzer is None:
+        return {}, {}, {}
 
     findings = {}
     samples = {}

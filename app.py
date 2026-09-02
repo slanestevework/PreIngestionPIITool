@@ -37,7 +37,6 @@ from data_quality import (
     run_auto_expectations,
 )
 from patterns import PII_REGEXES
-from scanner import analyzer as presidio_analyzer
 from scanner import scan_dataframe
 from remediate import (
     NAME_LIKE_COLUMN_HINTS,

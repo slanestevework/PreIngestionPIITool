@@ -3,6 +3,9 @@ FROM python:3.11-slim
 ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
     PIP_NO_CACHE_DIR=1 \
+    HOME=/tmp \
+    XDG_CACHE_HOME=/tmp/.cache \
+    GUNICORN_CMD_ARGS=--worker-tmp-dir=/tmp \
     PORT=8000
 
 WORKDIR /app
@@ -16,7 +19,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 COPY requirements.txt ./requirements.txt
 RUN pip install --upgrade pip && \
     pip install -r requirements.txt && \
-    pip install gunicorn
+    pip install gunicorn en-core-web-sm
 
 COPY . .
 
