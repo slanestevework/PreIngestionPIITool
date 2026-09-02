@@ -19,7 +19,8 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 COPY requirements.txt ./requirements.txt
 RUN pip install --upgrade pip && \
     pip install -r requirements.txt && \
-    pip install gunicorn en-core-web-sm
+    pip install gunicorn && \
+    python -m spacy download en_core_web_sm
 
 COPY . .
 
