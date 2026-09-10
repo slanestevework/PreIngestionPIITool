@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import io
 import json
+import random
 import time
 import zipfile
 from dataclasses import dataclass, field
@@ -25,6 +26,7 @@ if os.name == "nt":
 import pandas as pd
 import requests
 import streamlit as st
+from fastavro import reader as avro_reader
 
 # ---------------------------------------------------------------------------
 # Config
@@ -203,6 +205,30 @@ def _expand_uploads(uploaded_files) -> list[tuple[str, bytes]]:
         else:
             result.append((name, data))
     return result
+
+
+def _sample_avro_for_analysis(
+    file_name: str,
+    file_bytes: bytes,
+    max_rows: int,
+) -> tuple[str, bytes, int]:
+    """Create a bounded CSV payload from an Avro stream using deterministic reservoir sampling."""
+    reservoir: list[dict[str, Any]] = []
+    seen = 0
+    rng = random.Random(42)
+    records = avro_reader(io.BytesIO(file_bytes))
+    for record in records:
+        seen += 1
+        if len(reservoir) < max_rows:
+            reservoir.append(record)
+            continue
+        replacement = rng.randrange(seen)
+        if replacement < max_rows:
+            reservoir[replacement] = record
+
+    sample_name = f"{Path(file_name).stem}.sample.csv"
+    sample_bytes = pd.DataFrame(reservoir).to_csv(index=False).encode("utf-8")
+    return sample_name, sample_bytes, seen
 
 # ---------------------------------------------------------------------------
 # Log rendering
@@ -699,9 +725,44 @@ uploaded_files = st.file_uploader(
     accept_multiple_files=True,
 )
 
+sample_large_files = st.checkbox(
+    "Use representative sample for large Avro files",
+    value=True,
+    help="Streams the Avro file and sends at most the selected number of sampled rows to each API operation.",
+)
+sample_row_limit = st.number_input(
+    "Maximum sampled rows",
+    min_value=100,
+    max_value=50000,
+    value=10000,
+    step=1000,
+    disabled=not sample_large_files,
+)
+
 input_files: list[tuple[str, bytes]] = []
 if uploaded_files:
     input_files = _expand_uploads(uploaded_files)
+    if sample_large_files:
+        sampled_files: list[tuple[str, bytes]] = []
+        for file_name, file_bytes in input_files:
+            if Path(file_name).suffix.lower() != ".avro":
+                sampled_files.append((file_name, file_bytes))
+                continue
+            try:
+                sampled_name, sampled_bytes, total_rows = _sample_avro_for_analysis(
+                    file_name,
+                    file_bytes,
+                    int(sample_row_limit),
+                )
+                sampled_files.append((sampled_name, sampled_bytes))
+                st.info(
+                    f"{file_name}: using {min(total_rows, int(sample_row_limit)):,} sampled rows "
+                    f"from {total_rows:,} total rows for API analysis."
+                )
+            except Exception as exc:
+                st.error(f"Could not sample {file_name}: {exc}")
+                sampled_files.append((file_name, file_bytes))
+        input_files = sampled_files
     st.info(f"{len(input_files)} file(s) queued  •  Operations: "
             + ", ".join(filter(None, [
                 "PII Detection" if do_pii else "",

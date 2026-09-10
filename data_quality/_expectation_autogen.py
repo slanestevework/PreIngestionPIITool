@@ -205,13 +205,34 @@ def _col_profile(series: pd.Series, max_samples: int = 5, max_top: int = 8) -> d
     return profile
 
 
+_LLM_PROFILE_ROWS = 1000
+
+
+def _representative_sample(df: pd.DataFrame, max_rows: int = _LLM_PROFILE_ROWS) -> pd.DataFrame:
+    """Return a bounded sample covering the beginning, middle, and end of a dataset."""
+    if len(df) <= max_rows:
+        return df
+
+    head_count = max_rows // 3
+    tail_count = max_rows // 3
+    middle_count = max_rows - head_count - tail_count
+    middle_start = max(0, (len(df) - middle_count) // 2)
+    middle_end = middle_start + middle_count
+    return pd.concat(
+        [df.iloc[:head_count], df.iloc[middle_start:middle_end], df.iloc[-tail_count:]],
+        ignore_index=True,
+    )
+
+
 def _dataset_profile(df: pd.DataFrame, max_columns: int = 25, max_samples: int = 5, max_top: int = 8) -> dict[str, Any]:
+    profile_df = _representative_sample(df)
     selected_columns = list(df.columns)[:max_columns]
     return {
         "row_count": int(df.shape[0]),
+        "profile_sample_rows": int(profile_df.shape[0]),
         "column_count": int(df.shape[1]),
         "columns": {
-            str(col): _col_profile(df[col], max_samples=max_samples, max_top=max_top)
+            str(col): _col_profile(profile_df[col], max_samples=max_samples, max_top=max_top)
             for col in selected_columns
         },
     }
@@ -224,12 +245,14 @@ def _batch_profile(
     max_top: int = 8,
 ) -> dict[str, Any]:
     """Profile for a column subset — tells the LLM the full dataset size for context."""
+    profile_df = _representative_sample(df)
     return {
         "row_count": int(df.shape[0]),
+        "profile_sample_rows": int(profile_df.shape[0]),
         "total_columns": int(df.shape[1]),
         "batch_columns": len(columns),
         "columns": {
-            str(col): _col_profile(df[col], max_samples=max_samples, max_top=max_top)
+            str(col): _col_profile(profile_df[col], max_samples=max_samples, max_top=max_top)
             for col in columns
         },
     }
