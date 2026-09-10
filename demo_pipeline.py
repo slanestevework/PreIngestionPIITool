@@ -32,7 +32,7 @@ import streamlit as st
 
 DEFAULT_API_BASE = os.getenv("PII_SCANNER_API_BASE", "http://localhost:8000")
 PUBLIC_API_BASE = os.getenv("PII_SCANNER_PUBLIC_API_URL", "").strip().rstrip("/")
-SUPPORTED_TYPES = ["csv", "json", "parquet", "txt", "xlsx", "xls", "zip"]
+SUPPORTED_TYPES = ["avro", "csv", "json", "parquet", "txt", "xlsx", "xls", "zip"]
 RISK_COLORS = {
     "CRITICAL": "#d32f2f",
     "HIGH": "#f57c00",
@@ -177,6 +177,7 @@ def _mime_for(file_name: str) -> str:
     ext = Path(file_name).suffix.lower()
     return {
         ".csv": "text/csv",
+        ".avro": "application/avro",
         ".json": "application/json",
         ".parquet": "application/octet-stream",
         ".txt": "text/plain",
@@ -197,7 +198,7 @@ def _expand_uploads(uploaded_files) -> list[tuple[str, bytes]]:
                     if member.is_dir():
                         continue
                     ext = Path(member.filename).suffix.lower().lstrip(".")
-                    if ext in {"csv", "json", "parquet", "txt", "xlsx", "xls"}:
+                    if ext in {"avro", "csv", "json", "parquet", "txt", "xlsx", "xls"}:
                         result.append((Path(member.filename).name, zf.read(member)))
         else:
             result.append((name, data))

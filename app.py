@@ -408,7 +408,7 @@ with st.sidebar:
 
 uploaded_files = st.file_uploader(
     "Upload multiple files or a ZIP archive",
-    type=["csv", "json", "parquet", "txt", "xlsx", "xls", "zip"],
+    type=["avro", "csv", "json", "parquet", "txt", "xlsx", "xls", "zip"],
     accept_multiple_files=True,
 )
 
