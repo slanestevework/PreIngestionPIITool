@@ -33,6 +33,9 @@ spec:
             secretKeyRef:
               name: pii-scanner-secret
               key: api-key
+        envFrom:
+        - secretRef:
+            name: azure-openai-credentials
         readinessProbe:
           httpGet:
             path: /health
