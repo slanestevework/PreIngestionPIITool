@@ -48,6 +48,9 @@ _HUMAN_LABELS: dict[str, str] = {
     "expect_column_values_to_not_be_null": "Column has too many nulls",
     "expect_column_values_to_be_in_set": "Column contains unexpected values",
     "expect_column_values_to_be_between": "Column values out of allowed range",
+    "expect_column_values_to_be_unique": "Column values must be unique",
+    "expect_column_values_to_match_regex": "Column value format mismatch",
+    "expect_column_value_lengths_to_be_between": "Column value length out of range",
 }
 
 

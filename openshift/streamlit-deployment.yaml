@@ -1,0 +1,103 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: pii-scanner-demo
+  labels:
+    app: pii-scanner-demo
+  annotations:
+    image.openshift.io/triggers: '[{"from":{"kind":"ImageStreamTag","name":"pii-scanner-api:latest"},"fieldPath":"spec.template.spec.containers[?(@.name==\"demo\")].image"}]'
+spec:
+  replicas: 1
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app: pii-scanner-demo
+  template:
+    metadata:
+      labels:
+        app: pii-scanner-demo
+    spec:
+      containers:
+      - name: demo
+        image: image-registry.openshift-image-registry.svc:5000/${NAMESPACE}/pii-scanner-api:latest
+        imagePullPolicy: Always
+        command:
+        - python
+        - -m
+        - streamlit
+        args:
+        - run
+        - demo_pipeline.py
+        - --server.address=0.0.0.0
+        - --server.port=8501
+        - --server.headless=true
+        - --browser.gatherUsageStats=false
+        ports:
+        - containerPort: 8501
+          name: http
+        env:
+        - name: PII_SCANNER_API_BASE
+          value: http://pii-scanner-api:8000
+        - name: PII_SCANNER_PUBLIC_API_URL
+          value: https://pii-scanner-api-48572-imoapi-xgd502np-ts.apps.osxgdch502np.southernco.com
+        - name: PII_SCANNER_API_KEY
+          valueFrom:
+            secretKeyRef:
+              name: pii-scanner-demo-credentials
+              key: api-key
+        readinessProbe:
+          httpGet:
+            path: /_stcore/health
+            port: http
+          initialDelaySeconds: 10
+          periodSeconds: 10
+          timeoutSeconds: 3
+          failureThreshold: 6
+        livenessProbe:
+          httpGet:
+            path: /_stcore/health
+            port: http
+          initialDelaySeconds: 30
+          periodSeconds: 20
+          timeoutSeconds: 3
+          failureThreshold: 3
+        resources:
+          requests:
+            cpu: 25m
+            memory: 128Mi
+          limits:
+            cpu: 500m
+            memory: 256Mi
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: pii-scanner-demo
+  labels:
+    app: pii-scanner-demo
+spec:
+  selector:
+    app: pii-scanner-demo
+  ports:
+  - name: http
+    port: 8501
+    targetPort: http
+---
+apiVersion: route.openshift.io/v1
+kind: Route
+metadata:
+  name: pii-scanner-demo
+  labels:
+    app: pii-scanner-demo
+  annotations:
+    haproxy.router.openshift.io/timeout: 1h
+spec:
+  to:
+    kind: Service
+    name: pii-scanner-demo
+  port:
+    targetPort: http
+  tls:
+    termination: edge
+    insecureEdgeTerminationPolicy: Redirect

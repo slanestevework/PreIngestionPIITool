@@ -17,6 +17,11 @@ from typing import Any
 
 import os
 
+if os.name == "nt":
+    import truststore
+
+    truststore.inject_into_ssl()
+
 import pandas as pd
 import requests
 import streamlit as st
@@ -25,7 +30,8 @@ import streamlit as st
 # Config
 # ---------------------------------------------------------------------------
 
-DEFAULT_API_BASE = "http://localhost:8000"
+DEFAULT_API_BASE = os.getenv("PII_SCANNER_API_BASE", "http://localhost:8000")
+PUBLIC_API_BASE = os.getenv("PII_SCANNER_PUBLIC_API_URL", "").strip().rstrip("/")
 SUPPORTED_TYPES = ["csv", "json", "parquet", "txt", "xlsx", "xls", "zip"]
 RISK_COLORS = {
     "CRITICAL": "#d32f2f",
@@ -109,7 +115,7 @@ def _call_api(
             files=files,
             params=params or {},
             headers=headers,
-            timeout=120,
+            timeout=330,
         )
         elapsed_ms = round((time.perf_counter() - t0) * 1000)
         try:
@@ -452,6 +458,7 @@ def _render_auto_expectations(auto_exp: dict[str, Any]) -> None:
                         "Status": o.get("status_icon", ""),
                         "Expectation": o.get("expectation_label", o.get("expectation", "")),
                         "Column": o.get("column", ""),
+                        "Source": o.get("generation_source", "LLM"),
                         "Confidence": o.get("confidence", ""),
                         "Rationale": o.get("rationale", ""),
                     }
@@ -462,6 +469,7 @@ def _render_auto_expectations(auto_exp: dict[str, Any]) -> None:
                     {
                         "Expectation": s.get("expectation_type", "").replace("expect_", "").replace("_", " ").title(),
                         "Column": s.get("column", ""),
+                        "Source": s.get("generation_source", "LLM"),
                         "Confidence": s.get("confidence", ""),
                         "Rationale": s.get("rationale", ""),
                     }
@@ -475,6 +483,8 @@ def _render_auto_expectations(auto_exp: dict[str, Any]) -> None:
         llm_chars = ae_diag.get("llm_response_chars", 0)
         llm_items = ae_diag.get("llm_items_parsed", 0)
         accepted = ae_diag.get("specs_accepted", 0)
+        llm_accepted = ae_diag.get("llm_specs_accepted", accepted)
+        fallback_count = ae_diag.get("profile_fallback_specs", 0)
         rej_type = ae_diag.get("rejected_unknown_type", 0)
         rej_col = ae_diag.get("rejected_bad_column", 0)
         raw_preview = ae_diag.get("raw_llm_preview", "")
@@ -488,9 +498,10 @@ def _render_auto_expectations(auto_exp: dict[str, Any]) -> None:
             st.markdown(
                 f"- **{batches}** LLM batch call(s), **{llm_chars}** total chars, "
                 f"finish reasons: {finish_str}\n"
-                f"- **{llm_items}** item(s) parsed → accepted: **{accepted}** / "
+                f"- **{llm_items}** item(s) parsed → LLM accepted: **{llm_accepted}** / "
                 f"rejected (unknown type): **{rej_type}** / "
-                f"rejected (unrecognised column): **{rej_col}**"
+                f"rejected (unrecognised column): **{rej_col}**\n"
+                f"- Profile fallbacks added: **{fallback_count}** / total executed: **{accepted}**"
             )
             if hint:
                 st.info(hint)
@@ -527,6 +538,44 @@ def _render_remediation_result(result: dict[str, Any], file_name: str) -> None:
             mime="text/csv",
         )
 
+
+def _render_pipeline_result(result: PipelineResult) -> None:
+    st.caption(f"Results for `{result.file_name}`")
+
+    if result.errors:
+        for error in result.errors:
+            st.error(error)
+
+    if result.pii_result:
+        st.markdown("#### 🔍 PII Detection")
+        _render_pii_result(result.pii_result, result.file_name)
+
+    if result.dq_result:
+        st.markdown("#### 📊 Data Quality — Great Expectations")
+        _render_dq_result(result.dq_result, result.file_name)
+
+    if result.ai_dq_result and result.ai_dq_result.get("auto_expectations"):
+        st.markdown(f"#### ⚙️ LLM-Generated Expectations — `{result.file_name}`")
+        _render_auto_expectations(result.ai_dq_result["auto_expectations"])
+
+    if result.ai_dq_result:
+        ai_without_auto = {
+            key: value
+            for key, value in result.ai_dq_result.items()
+            if key != "auto_expectations"
+        }
+        if any(key in ai_without_auto for key in [
+            "narrative", "anomalies", "semantic_pii_risks", "regulatory_flags",
+            "quasi_identifiers", "format_anomalies", "plausibility_issues",
+            "consistency_issues", "completeness_issues",
+        ]):
+            st.markdown("#### 🤖 AI-Powered DQ Analysis")
+            _render_ai_dq_result(ai_without_auto)
+
+    if result.remediation_result:
+        st.markdown("#### 🛡️ PII Remediation")
+        _render_remediation_result(result.remediation_result, result.file_name)
+
 # ---------------------------------------------------------------------------
 # Page layout
 # ---------------------------------------------------------------------------
@@ -540,17 +589,33 @@ st.set_page_config(
 # Sidebar — connection settings
 with st.sidebar:
     st.header("API Connection")
+    managed_api_base = bool(os.getenv("PII_SCANNER_API_BASE", "").strip())
     api_base = st.text_input(
-        "FastAPI base URL",
+        "API target (server-side)" if managed_api_base else "FastAPI base URL",
         value=DEFAULT_API_BASE,
-        help="Start the server with: uvicorn api:app --reload",
+        disabled=managed_api_base,
+        help=(
+            "Managed by the OpenShift deployment and resolved inside the demo container."
+            if managed_api_base
+            else "Start the server with: uvicorn api:app --reload"
+        ),
     )
-    api_key = st.text_input(
-        "API Key (leave blank if none)",
-        value=os.getenv("PII_SCANNER_API_KEY", ""),
-        type="password",
-        help="Defaults to the PII_SCANNER_API_KEY environment variable if set.",
-    )
+    configured_api_key = os.getenv("PII_SCANNER_API_KEY", "")
+    if configured_api_key:
+        api_key = configured_api_key
+        st.success("API authentication configured")
+    else:
+        api_key = st.text_input(
+            "API Key (leave blank if none)",
+            value="",
+            type="password",
+        )
+    if PUBLIC_API_BASE:
+        st.info(
+            f"External applications can call [{PUBLIC_API_BASE}]({PUBLIC_API_BASE}).  \n"
+            f"[Open API documentation]({PUBLIC_API_BASE}/docs)  \n"
+            "Protected endpoints require the `X-API-Key` request header."
+        )
     st.divider()
     st.header("Remediation Options")
     remediation_mode = st.selectbox(
@@ -826,38 +891,13 @@ if run_clicked and input_files and (do_pii or do_dq or do_remediation):
     st.divider()
     st.subheader("📈 Pipeline Results")
 
-    for pr in results:
-        with st.expander(f"**{pr.file_name}**", expanded=True):
-            if pr.errors:
-                for err in pr.errors:
-                    st.error(err)
-
-            if pr.pii_result:
-                st.markdown("#### 🔍 PII Detection")
-                _render_pii_result(pr.pii_result, pr.file_name)
-
-            if pr.dq_result:
-                st.markdown("#### 📊 Data Quality — Great Expectations")
-                _render_dq_result(pr.dq_result, pr.file_name)
-
-            # Auto-generated expectations slot in directly after standard GE checks
-            if pr.ai_dq_result and pr.ai_dq_result.get("auto_expectations"):
-                st.markdown("#### ⚙️ LLM-Generated Expectations")
-                _render_auto_expectations(pr.ai_dq_result["auto_expectations"])
-
-            if pr.ai_dq_result:
-                ai_without_auto = {k: v for k, v in pr.ai_dq_result.items() if k != "auto_expectations"}
-                if any(k in ai_without_auto for k in [
-                    "narrative", "anomalies", "semantic_pii_risks", "regulatory_flags",
-                    "quasi_identifiers", "format_anomalies", "plausibility_issues",
-                    "consistency_issues", "completeness_issues",
-                ]):
-                    st.markdown("#### 🤖 AI-Powered DQ Analysis")
-                    _render_ai_dq_result(ai_without_auto)
-
-            if pr.remediation_result:
-                st.markdown("#### 🛡️ PII Remediation")
-                _render_remediation_result(pr.remediation_result, pr.file_name)
+    if len(results) > 1:
+        result_tabs = st.tabs([result.file_name for result in results])
+        for result_tab, result in zip(result_tabs, results):
+            with result_tab:
+                _render_pipeline_result(result)
+    else:
+        _render_pipeline_result(results[0])
 
     # Summary table
     if len(results) > 1:

@@ -7,6 +7,7 @@ from pathlib import Path
 from typing import Any
 
 import pandas as pd
+from fastavro import reader
 from fastapi import Depends, FastAPI, File, Header, HTTPException, UploadFile
 from pydantic import BaseModel, Field
 
@@ -56,7 +57,7 @@ app = FastAPI(
     version="1.0.0",
 )
 
-SUPPORTED_EXTENSIONS = {"csv", "json", "parquet", "txt", "xlsx", "xls"}
+SUPPORTED_EXTENSIONS = {"avro", "csv", "json", "parquet", "txt", "xlsx", "xls"}
 
 
 def _require_api_key(x_api_key: str | None = Header(default=None)) -> None:
@@ -102,11 +103,17 @@ def _load_json_dataframe_from_bytes(payload: bytes) -> pd.DataFrame:
     )
 
 
+def _load_avro_dataframe_from_bytes(payload: bytes) -> pd.DataFrame:
+    return pd.DataFrame(list(reader(BytesIO(payload))))
+
+
 def _load_dataframe_from_upload(upload_file: UploadFile, payload: bytes) -> pd.DataFrame:
     extension = Path(upload_file.filename or "").suffix.lower().lstrip(".")
 
     if extension == "csv":
         return pd.read_csv(BytesIO(payload), dtype=str)
+    if extension == "avro":
+        return _load_avro_dataframe_from_bytes(payload)
     if extension == "json":
         return _load_json_dataframe_from_bytes(payload)
     if extension == "parquet":
@@ -119,7 +126,7 @@ def _load_dataframe_from_upload(upload_file: UploadFile, payload: bytes) -> pd.D
 
     raise HTTPException(
         status_code=400,
-        detail="Unsupported file type. Use csv, json, parquet, txt, xlsx, or xls.",
+        detail="Unsupported file type. Use avro, csv, json, parquet, txt, xlsx, or xls.",
     )
 
 
@@ -156,7 +163,7 @@ async def scan_file(file: UploadFile = File(...)) -> dict[str, Any]:
     if extension not in SUPPORTED_EXTENSIONS:
         raise HTTPException(
             status_code=400,
-            detail="Unsupported file type. Use csv, json, parquet, txt, xlsx, or xls.",
+            detail="Unsupported file type. Use avro, csv, json, parquet, txt, xlsx, or xls.",
         )
 
     payload = await file.read()
@@ -190,7 +197,7 @@ async def quality_validate_file(file: UploadFile = File(...)) -> dict:
     if extension not in SUPPORTED_EXTENSIONS:
         raise HTTPException(
             status_code=400,
-            detail="Unsupported file type. Use csv, json, parquet, txt, xlsx, or xls.",
+            detail="Unsupported file type. Use avro, csv, json, parquet, txt, xlsx, or xls.",
         )
 
     payload = await file.read()
@@ -373,6 +380,7 @@ async def quality_ai_analysis_file(
                     "column": s.column,
                     "confidence": s.confidence,
                     "rationale": s.rationale,
+                    "generation_source": s.generation_source,
                 }
                 for s in auto_run.specs
             ],
@@ -395,7 +403,7 @@ async def remediate_file(
     if extension not in SUPPORTED_EXTENSIONS:
         raise HTTPException(
             status_code=400,
-            detail="Unsupported file type. Use csv, json, parquet, txt, xlsx, or xls.",
+            detail="Unsupported file type. Use avro, csv, json, parquet, txt, xlsx, or xls.",
         )
     if mode not in {"redact", "mask_last4", "hash"}:
         raise HTTPException(status_code=400, detail="mode must be redact, mask_last4, or hash")

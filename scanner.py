@@ -2,6 +2,7 @@ from datetime import datetime
 import os
 import json
 import pandas as pd
+from fastavro import reader
 from patterns import (PII_NAME_HINTS, PII_REGEXES, COLUMN_PATTERN_MAP, HIGH_RISK_PATTERNS)
 from presidio_analyzer import AnalyzerEngine
 from presidio_analyzer.nlp_engine import NlpEngineProvider
@@ -429,6 +430,10 @@ def read_file(file_path):
                 file_path,
                 dtype=str
             )
+
+        elif ext == "avro":
+            with open(file_path, "rb") as handle:
+                return pd.DataFrame(list(reader(handle)))
 
         elif ext == "json":
             return _load_json_dataframe_from_path(file_path)

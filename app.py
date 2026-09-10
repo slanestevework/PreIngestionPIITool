@@ -10,6 +10,7 @@ from pathlib import Path
 from typing import Any, Hashable
 
 import pandas as pd
+from fastavro import reader, writer as avro_writer
 import streamlit as st
 
 from data_quality import (
@@ -112,11 +113,17 @@ def _load_json_dataframe_from_bytes(payload: bytes) -> pd.DataFrame:
     raise ValueError("Unsupported JSON structure. Expected object, array, or JSON lines.")
 
 
+def _load_avro_dataframe_from_bytes(payload: bytes) -> pd.DataFrame:
+    return pd.DataFrame(list(reader(io.BytesIO(payload))))
+
+
 def load_uploaded_dataframe(file_name: str, file_bytes: bytes) -> tuple[pd.DataFrame, str]:
     extension = Path(file_name).suffix.lower().lstrip(".")
 
     if extension == "csv":
         return pd.read_csv(io.BytesIO(file_bytes), dtype=str), extension
+    if extension == "avro":
+        return _load_avro_dataframe_from_bytes(file_bytes), extension
     if extension == "json":
         return _load_json_dataframe_from_bytes(file_bytes), extension
     if extension == "parquet":
@@ -128,7 +135,7 @@ def load_uploaded_dataframe(file_name: str, file_bytes: bytes) -> tuple[pd.DataF
         return pd.read_excel(io.BytesIO(file_bytes), dtype=str), extension
 
     raise ValueError(
-        "Unsupported file type. Use csv, json, parquet, txt, xlsx, or xls."
+        "Unsupported file type. Use avro, csv, json, parquet, txt, xlsx, or xls."
     )
 
 
@@ -152,7 +159,7 @@ def expand_input_files(uploaded_files) -> list[InputFile]:
                     continue
 
                 member_ext = Path(member_name).suffix.lower().lstrip(".")
-                if member_ext not in {"csv", "json", "parquet", "txt", "xlsx", "xls"}:
+                if member_ext not in {"avro", "csv", "json", "parquet", "txt", "xlsx", "xls"}:
                     continue
 
                 expanded.append(InputFile(name=Path(member_name).name, payload=zf.read(member)))
@@ -270,6 +277,16 @@ def _replace_samples(value: str, samples: list[str], token: str) -> str:
 
 
 def dataframe_to_bytes(df: pd.DataFrame, extension: str) -> bytes:
+    if extension == "avro":
+        buffer = io.BytesIO()
+        fields = [{"name": str(column), "type": ["null", "string"]} for column in df.columns]
+        schema = {"type": "record", "name": "RemediatedRecord", "fields": fields}
+        records = [
+            {str(column): None if pd.isna(value) else str(value) for column, value in row.items()}
+            for row in df.to_dict(orient="records")
+        ]
+        avro_writer(buffer, schema, records)
+        return buffer.getvalue()
     if extension == "csv":
         return df.to_csv(index=False).encode("utf-8")
     if extension == "json":

@@ -4,8 +4,12 @@ metadata:
   name: pii-scanner-api
   labels:
     app: pii-scanner-api
+  annotations:
+    haproxy.router.openshift.io/timeout: 300s
 spec:
   replicas: 1
+  strategy:
+    type: Recreate
   selector:
     matchLabels:
       app: pii-scanner-api

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import re
 from dataclasses import dataclass
 from typing import Any
 
@@ -76,9 +77,12 @@ _EXPECTATION_SYSTEM = (
     "1) Use only columns present in the profile. "
     "2) Keep kwargs small and valid for Great Expectations. "
     "3) Prefer robust ranges and mostly thresholds over brittle exact checks. "
+    "Completeness checks must use mostly >= 0.95; do not copy the observed null rate. "
+    "Expectations should express reasonable quality standards and may fail the profiled data. "
     "4) For in_set, keep value_set <= 25 values. "
     "5) confidence must be HIGH, MEDIUM, or LOW. "
-    "6) Return at most 25 expectations. "
+    "6) Propose at least 2 distinct expectation types for every profiled column. "
+    "7) Return at most 25 expectations. "
     "Return only JSON with no markdown."
 )
 
@@ -100,6 +104,12 @@ _EXPECTATION_BUILDERS = {
     "expect_column_value_lengths_to_be_between": gx.expectations.ExpectColumnValueLengthsToBeBetween,
 }
 
+_IDENTIFIER_COLUMN_PATTERN = re.compile(r"\b(id|uuid|key|identifier|reference)\b", re.IGNORECASE)
+_DATE_COLUMN_PATTERN = re.compile(r"\b(date|dated|restocked|timestamp|time)\b", re.IGNORECASE)
+_NUMERIC_VALUE_PATTERN = r"^[+-]?(?:\d+(?:\.\d*)?|\.\d+)$"
+_DATE_VALUE_PATTERN = r"^(?:\d{4}-\d{2}-\d{2}|\d{2}[/-]\d{2}[/-]\d{4})$"
+_TRIMMED_TEXT_PATTERN = r"^\S(?:.*\S)?$"
+
 
 @dataclass
 class AutoExpectationSpec:
@@ -108,6 +118,7 @@ class AutoExpectationSpec:
     kwargs: dict[str, Any]
     rationale: str
     confidence: str
+    generation_source: str = "LLM"
 
 
 @dataclass
@@ -170,14 +181,19 @@ def _col_profile(series: pd.Series, max_samples: int = 5, max_top: int = 8) -> d
                 }
             )
 
-    if non_null_count and pd.api.types.is_object_dtype(series):
+    if non_null_count and (
+        pd.api.types.is_object_dtype(series) or pd.api.types.is_string_dtype(series)
+    ):
         as_text = non_null.astype(str)
         lengths = as_text.str.len()
+        numeric_matches = as_text.str.fullmatch(_NUMERIC_VALUE_PATTERN)
         profile.update(
             {
                 "len_min": int(lengths.min()),
                 "len_max": int(lengths.max()),
                 "len_p95": float(lengths.quantile(0.95)),
+                "numeric_parse_pct": round(float(numeric_matches.mean() * 100), 2),
+                "trimmed_pct": round(float((as_text == as_text.str.strip()).mean() * 100), 2),
             }
         )
         top = as_text.value_counts(dropna=True).head(max_top)
@@ -240,7 +256,7 @@ def _sanitize_spec(raw: dict[str, Any], allowed_columns: set[str]) -> AutoExpect
             mostly_value = float(mostly)
         except (TypeError, ValueError):
             mostly_value = 1.0
-        cleaned_kwargs["mostly"] = min(1.0, max(0.0, mostly_value))
+        cleaned_kwargs["mostly"] = min(1.0, max(0.95, mostly_value))
 
     if expectation_type == "expect_column_values_to_be_in_set":
         value_set = cleaned_kwargs.get("value_set", [])
@@ -322,32 +338,140 @@ def _build_gx_expectations(specs: list[AutoExpectationSpec]) -> list:
     return expectations
 
 
+def _ensure_minimum_column_coverage(
+    df: pd.DataFrame,
+    specs: list[AutoExpectationSpec],
+    minimum_per_column: int = 2,
+) -> list[AutoExpectationSpec]:
+    supplemented = list(specs)
+
+    for column in df.columns:
+        column_name = str(column)
+        series = df[column]
+        non_null = series.dropna()
+        existing_types = {
+            spec.expectation_type for spec in supplemented if spec.column == column_name
+        }
+        candidates: list[AutoExpectationSpec] = [
+            AutoExpectationSpec(
+                expectation_type="expect_column_values_to_not_be_null",
+                column=column_name,
+                kwargs={
+                    "column": column_name,
+                    "mostly": 0.95,
+                },
+                rationale="Baseline policy requires at least 95% populated values.",
+                confidence="MEDIUM",
+                generation_source="PROFILE_FALLBACK",
+            )
+        ]
+
+        if _IDENTIFIER_COLUMN_PATTERN.search(column_name):
+            candidates.append(
+                AutoExpectationSpec(
+                    expectation_type="expect_column_values_to_be_unique",
+                    column=column_name,
+                    kwargs={"column": column_name},
+                    rationale="Identifier columns should uniquely identify records.",
+                    confidence="HIGH",
+                    generation_source="PROFILE_FALLBACK",
+                )
+            )
+        elif _DATE_COLUMN_PATTERN.search(column_name):
+            candidates.append(
+                AutoExpectationSpec(
+                    expectation_type="expect_column_values_to_match_regex",
+                    column=column_name,
+                    kwargs={"column": column_name, "regex": _DATE_VALUE_PATTERN},
+                    rationale="Date-like columns should use a recognizable, consistent date format.",
+                    confidence="HIGH",
+                    generation_source="PROFILE_FALLBACK",
+                )
+            )
+        else:
+            text_values = non_null.astype(str)
+            numeric_ratio = (
+                float(text_values.str.fullmatch(_NUMERIC_VALUE_PATTERN).mean())
+                if not text_values.empty else 0.0
+            )
+            pattern = _NUMERIC_VALUE_PATTERN if numeric_ratio >= 0.5 else _TRIMMED_TEXT_PATTERN
+            rationale = (
+                "Numeric-like columns should not contain words or malformed numbers."
+                if numeric_ratio >= 0.5
+                else "Text values should not contain leading or trailing whitespace."
+            )
+            candidates.append(
+                AutoExpectationSpec(
+                    expectation_type="expect_column_values_to_match_regex",
+                    column=column_name,
+                    kwargs={"column": column_name, "regex": pattern},
+                    rationale=rationale,
+                    confidence="MEDIUM",
+                    generation_source="PROFILE_FALLBACK",
+                )
+            )
+
+        for candidate in candidates[:minimum_per_column]:
+            if candidate.expectation_type in existing_types:
+                continue
+            supplemented.append(candidate)
+            existing_types.add(candidate.expectation_type)
+
+    return supplemented
+
+
 def _build_outcomes(specs: list[AutoExpectationSpec], validation_result) -> list[dict[str, Any]]:
     outcomes: list[dict[str, Any]] = []
     raw_results = list(getattr(validation_result, "results", []) or [])
+    unmatched_specs = list(specs)
 
-    for idx, spec in enumerate(specs):
-        passed = None
+    for result in raw_results:
+        config = result.expectation_config
+        expectation_type = str(getattr(config, "type", "")).lower()
+        config_kwargs = dict(getattr(config, "kwargs", {}) or {})
+        config_kwargs.pop("batch_id", None)
+        column = str(config_kwargs.get("column", ""))
+
+        matching_index = next(
+            (
+                index for index, candidate in enumerate(unmatched_specs)
+                if candidate.expectation_type == expectation_type
+                and candidate.column == column
+                and candidate.kwargs == config_kwargs
+            ),
+            None,
+        )
+        if matching_index is None:
+            matching_index = next(
+                (
+                    index for index, candidate in enumerate(unmatched_specs)
+                    if candidate.expectation_type == expectation_type
+                    and candidate.column == column
+                ),
+                None,
+            )
+        if matching_index is None:
+            continue
+
+        spec = unmatched_specs.pop(matching_index)
+        passed = bool(result.success)
         failure_details: dict[str, str] = {}
-
-        if idx < len(raw_results):
-            result = raw_results[idx]
-            passed = bool(result.success)
-            if not passed:
-                failure_details = _format_failure_details(
-                    spec.expectation_type,
-                    result.result or {},
-                )
+        if not passed:
+            failure_details = _format_failure_details(
+                spec.expectation_type,
+                result.result or {},
+            )
 
         outcomes.append(
             {
-                "index": idx + 1,
+                "index": len(outcomes) + 1,
                 "expectation": spec.expectation_type,
                 "expectation_label": _human_expectation_label(spec.expectation_type),
                 "column": spec.column,
                 "params": spec.kwargs,
                 "confidence": spec.confidence,
                 "rationale": spec.rationale,
+                "generation_source": spec.generation_source,
                 "passed": passed,
                 "status": "PASS" if passed else "FAIL",
                 "status_icon": "✅" if passed else "❌",
@@ -361,6 +485,8 @@ def _build_outcomes(specs: list[AutoExpectationSpec], validation_result) -> list
 def run_auto_expectations(df: pd.DataFrame, suite_name: str | None = None) -> AutoExpectationRun:
     try:
         total_chars, finish_reasons, llm_parsed, specs = _propose_with_diagnostics(df)
+        llm_spec_count = len(specs)
+        specs = _ensure_minimum_column_coverage(df, specs)
         allowed_columns = {str(c) for c in df.columns}
         n_batches = max(1, -(-len(df.columns) // _BATCH_SIZE))  # ceil division
 
@@ -380,6 +506,8 @@ def run_auto_expectations(df: pd.DataFrame, suite_name: str | None = None) -> Au
             "llm_finish_reasons": finish_reasons,
             "llm_items_parsed": len(llm_parsed),
             "specs_accepted": len(specs),
+            "llm_specs_accepted": llm_spec_count,
+            "profile_fallback_specs": len(specs) - llm_spec_count,
             "rejected_unknown_type": rejected_type,
             "rejected_bad_column": rejected_col,
         }

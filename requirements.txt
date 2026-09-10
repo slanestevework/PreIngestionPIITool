@@ -4,6 +4,7 @@ presidio-analyzer
 spacy
 openpyxl
 pyarrow
+fastavro
 fastapi
 uvicorn[standard]
 python-multipart
@@ -11,3 +12,4 @@ great-expectations>=1.0
 scikit-learn
 openai>=1.0
 python-dotenv
+truststore; sys_platform == "win32"
