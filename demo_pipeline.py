@@ -231,6 +231,46 @@ def _sample_avro_for_analysis(
     sample_bytes = pd.DataFrame(reservoir).to_csv(index=False).encode("utf-8")
     return sample_name, sample_bytes, seen
 
+
+def _sample_uploaded_avro_for_analysis(
+    file_name: str,
+    uploaded_file,
+    max_rows: int,
+) -> tuple[str, bytes, int]:
+    """Sample a Streamlit upload in place, avoiding a second full-file bytes copy."""
+    uploaded_file.seek(0)
+    reservoir: list[dict[str, Any]] = []
+    seen = 0
+    rng = random.Random(42)
+    for record in avro_reader(uploaded_file):
+        seen += 1
+        if len(reservoir) < max_rows:
+            reservoir.append(record)
+            continue
+        replacement = rng.randrange(seen)
+        if replacement < max_rows:
+            reservoir[replacement] = record
+
+    sample_name = f"{Path(file_name).stem}.sample.csv"
+    sample_bytes = pd.DataFrame(reservoir).to_csv(index=False).encode("utf-8")
+    return sample_name, sample_bytes, seen
+
+
+def _prepare_uploaded_files(uploaded_files, sample_large_files: bool, sample_row_limit: int) -> list[tuple[str, bytes]]:
+    """Prepare API payloads while avoiding a full-file copy for large direct Avro uploads."""
+    result: list[tuple[str, bytes]] = []
+    for uploaded in uploaded_files:
+        file_name = uploaded.name
+        if (
+            sample_large_files
+            and Path(file_name).suffix.lower() == ".avro"
+            and uploaded.size >= LARGE_FILE_BYTES
+        ):
+            result.append(_sample_uploaded_avro_for_analysis(file_name, uploaded, sample_row_limit)[:2])
+            continue
+        result.extend(_expand_uploads([uploaded]))
+    return result
+
 # ---------------------------------------------------------------------------
 # Log rendering
 # ---------------------------------------------------------------------------
@@ -805,31 +845,11 @@ if run_clicked and uploaded_files and (do_pii or do_dq or do_remediation):
     st.caption("Updates after each API call.")
     log_placeholder = st.empty()
 
-    input_files = _expand_uploads(uploaded_files)
-    if sample_large_files:
-        sampled_files: list[tuple[str, bytes]] = []
-        for file_name, file_bytes in input_files:
-            if (
-                Path(file_name).suffix.lower() != ".avro"
-                or len(file_bytes) < LARGE_FILE_BYTES
-            ):
-                sampled_files.append((file_name, file_bytes))
-                continue
-            try:
-                sampled_name, sampled_bytes, total_rows = _sample_avro_for_analysis(
-                    file_name,
-                    file_bytes,
-                    int(sample_row_limit),
-                )
-                sampled_files.append((sampled_name, sampled_bytes))
-                st.info(
-                    f"{file_name}: using {min(total_rows, int(sample_row_limit)):,} sampled rows "
-                    f"from {total_rows:,} total rows for API analysis."
-                )
-            except Exception as exc:
-                st.error(f"Could not sample {file_name}: {exc}")
-                sampled_files.append((file_name, file_bytes))
-        input_files = sampled_files
+    input_files = _prepare_uploaded_files(
+        uploaded_files,
+        sample_large_files=sample_large_files,
+        sample_row_limit=int(sample_row_limit),
+    )
 
     _op_count = sum([do_pii, do_dq, bool(_selected_ai_checks) if do_dq else 0, do_remediation])
     total_ops = len(input_files) * max(_op_count, 1)
