@@ -12,11 +12,12 @@ spec:
     type: Recreate
   selector:
     matchLabels:
-      app: pii-scanner-api
+      deployment: pii-scanner-api
   template:
     metadata:
       labels:
         app: pii-scanner-api
+        deployment: pii-scanner-api
     spec:
       containers:
       - name: api
