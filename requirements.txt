@@ -5,6 +5,7 @@ spacy
 openpyxl
 pyarrow
 fastavro
+cramjam
 fastapi
 uvicorn[standard]
 python-multipart
