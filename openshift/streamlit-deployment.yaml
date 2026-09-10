@@ -33,6 +33,7 @@ spec:
         - --server.port=8501
         - --server.headless=true
         - --browser.gatherUsageStats=false
+        - --server.maxUploadSize=2048
         ports:
         - containerPort: 8501
           name: http
@@ -68,7 +69,7 @@ spec:
             memory: 128Mi
           limits:
             cpu: 500m
-            memory: 256Mi
+            memory: 2Gi
 ---
 apiVersion: v1
 kind: Service
