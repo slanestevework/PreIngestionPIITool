@@ -734,9 +734,9 @@ sample_large_files = st.checkbox(
 sample_row_limit = st.number_input(
     "Maximum sampled rows",
     min_value=100,
-    max_value=50000,
-    value=10000,
-    step=1000,
+    max_value=10000,
+    value=1000,
+    step=100,
     disabled=not sample_large_files,
 )
 
