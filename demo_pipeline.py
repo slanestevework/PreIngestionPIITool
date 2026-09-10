@@ -35,6 +35,7 @@ from fastavro import reader as avro_reader
 DEFAULT_API_BASE = os.getenv("PII_SCANNER_API_BASE", "http://localhost:8000")
 PUBLIC_API_BASE = os.getenv("PII_SCANNER_PUBLIC_API_URL", "").strip().rstrip("/")
 SUPPORTED_TYPES = ["avro", "csv", "json", "parquet", "txt", "xlsx", "xls", "zip"]
+LARGE_FILE_BYTES = 100 * 1024 * 1024
 RISK_COLORS = {
     "CRITICAL": "#d32f2f",
     "HIGH": "#f57c00",
@@ -745,7 +746,10 @@ if uploaded_files:
     if sample_large_files:
         sampled_files: list[tuple[str, bytes]] = []
         for file_name, file_bytes in input_files:
-            if Path(file_name).suffix.lower() != ".avro":
+            if (
+                Path(file_name).suffix.lower() != ".avro"
+                or len(file_bytes) < LARGE_FILE_BYTES
+            ):
                 sampled_files.append((file_name, file_bytes))
                 continue
             try:
