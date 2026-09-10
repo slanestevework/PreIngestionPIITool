@@ -66,6 +66,8 @@ metadata:
   name: pii-scanner-api
   labels:
     app: pii-scanner-api
+  annotations:
+    haproxy.router.openshift.io/timeout: 900s
 spec:
   selector:
     app: pii-scanner-api
@@ -80,6 +82,8 @@ metadata:
   name: pii-scanner-api
   labels:
     app: pii-scanner-api
+  annotations:
+    haproxy.router.openshift.io/timeout: 900s
 spec:
   to:
     kind: Service
