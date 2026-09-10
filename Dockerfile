@@ -21,4 +21,4 @@ COPY . .
 EXPOSE 8000
 
 # OpenShift sends SIGTERM during rollout; use Gunicorn for graceful worker restarts.
-CMD ["gunicorn", "-w", "2", "-k", "uvicorn.workers.UvicornWorker", "api:app", "--bind", "0.0.0.0:8000", "--timeout", "300"]
+CMD ["gunicorn", "-w", "2", "-k", "uvicorn.workers.UvicornWorker", "api:app", "--bind", "0.0.0.0:8000", "--timeout", "900"]

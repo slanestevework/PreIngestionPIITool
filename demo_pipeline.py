@@ -118,7 +118,7 @@ def _call_api(
             files=files,
             params=params or {},
             headers=headers,
-            timeout=330,
+            timeout=1000,
         )
         elapsed_ms = round((time.perf_counter() - t0) * 1000)
         try:

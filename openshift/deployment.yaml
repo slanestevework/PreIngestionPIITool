@@ -5,7 +5,7 @@ metadata:
   labels:
     app: pii-scanner-api
   annotations:
-    haproxy.router.openshift.io/timeout: 300s
+    haproxy.router.openshift.io/timeout: 900s
     image.openshift.io/triggers: '[{"from":{"kind":"ImageStreamTag","name":"pii-scanner-api:latest"},"fieldPath":"spec.template.spec.containers[?(@.name==\"api\")].image"}]'
 spec:
   replicas: 1
