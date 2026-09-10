@@ -742,32 +742,7 @@ sample_row_limit = st.number_input(
 
 input_files: list[tuple[str, bytes]] = []
 if uploaded_files:
-    input_files = _expand_uploads(uploaded_files)
-    if sample_large_files:
-        sampled_files: list[tuple[str, bytes]] = []
-        for file_name, file_bytes in input_files:
-            if (
-                Path(file_name).suffix.lower() != ".avro"
-                or len(file_bytes) < LARGE_FILE_BYTES
-            ):
-                sampled_files.append((file_name, file_bytes))
-                continue
-            try:
-                sampled_name, sampled_bytes, total_rows = _sample_avro_for_analysis(
-                    file_name,
-                    file_bytes,
-                    int(sample_row_limit),
-                )
-                sampled_files.append((sampled_name, sampled_bytes))
-                st.info(
-                    f"{file_name}: using {min(total_rows, int(sample_row_limit)):,} sampled rows "
-                    f"from {total_rows:,} total rows for API analysis."
-                )
-            except Exception as exc:
-                st.error(f"Could not sample {file_name}: {exc}")
-                sampled_files.append((file_name, file_bytes))
-        input_files = sampled_files
-    st.info(f"{len(input_files)} file(s) queued  •  Operations: "
+    st.info(f"{len(uploaded_files)} upload(s) queued  •  Operations: "
             + ", ".join(filter(None, [
                 "PII Detection" if do_pii else "",
                 "DQ Analysis" if do_dq else "",
@@ -780,17 +755,17 @@ st.divider()
 run_clicked = st.button(
     "▶  Run Pipeline",
     type="primary",
-    disabled=not input_files or not (do_pii or do_dq or do_remediation),
+    disabled=not uploaded_files or not (do_pii or do_dq or do_remediation),
 )
 
-if run_clicked and not input_files:
+if run_clicked and not uploaded_files:
     st.warning("Upload at least one file to run the pipeline.")
 
 # ---------------------------------------------------------------------------
 # Pipeline execution
 # ---------------------------------------------------------------------------
 
-if run_clicked and input_files and (do_pii or do_dq or do_remediation):
+if run_clicked and uploaded_files and (do_pii or do_dq or do_remediation):
     api_logs: list[APICallLog] = []
     results: list[PipelineResult] = []
     call_seq = 0
@@ -824,17 +799,42 @@ if run_clicked and input_files and (do_pii or do_dq or do_remediation):
     _selected_ai_checks = [(p, lbl) for p, lbl, on in _ai_checks if on]
     _any_ai_dq = bool(_selected_ai_checks)
 
-    _op_count = sum([do_pii, do_dq, len(_selected_ai_checks) if do_dq else 0, do_remediation])
-    total_ops = len(input_files) * max(_op_count, 1)
-    completed = 0
-
-    progress = st.progress(0, text="Starting pipeline…")
-
     # Live log placeholder — updated after every API call
     st.divider()
     st.subheader("📋 API Activity Log")
     st.caption("Updates after each API call.")
     log_placeholder = st.empty()
+
+    input_files = _expand_uploads(uploaded_files)
+    if sample_large_files:
+        sampled_files: list[tuple[str, bytes]] = []
+        for file_name, file_bytes in input_files:
+            if (
+                Path(file_name).suffix.lower() != ".avro"
+                or len(file_bytes) < LARGE_FILE_BYTES
+            ):
+                sampled_files.append((file_name, file_bytes))
+                continue
+            try:
+                sampled_name, sampled_bytes, total_rows = _sample_avro_for_analysis(
+                    file_name,
+                    file_bytes,
+                    int(sample_row_limit),
+                )
+                sampled_files.append((sampled_name, sampled_bytes))
+                st.info(
+                    f"{file_name}: using {min(total_rows, int(sample_row_limit)):,} sampled rows "
+                    f"from {total_rows:,} total rows for API analysis."
+                )
+            except Exception as exc:
+                st.error(f"Could not sample {file_name}: {exc}")
+                sampled_files.append((file_name, file_bytes))
+        input_files = sampled_files
+
+    _op_count = sum([do_pii, do_dq, len(_selected_ai_checks) if do_dq else 0, do_remediation])
+    total_ops = len(input_files) * max(_op_count, 1)
+    completed = 0
+    progress = st.progress(0, text="Starting pipeline…")
 
     for file_name, file_bytes in input_files:
         pr = PipelineResult(file_name=file_name)
