@@ -831,7 +831,7 @@ if run_clicked and uploaded_files and (do_pii or do_dq or do_remediation):
                 sampled_files.append((file_name, file_bytes))
         input_files = sampled_files
 
-    _op_count = sum([do_pii, do_dq, len(_selected_ai_checks) if do_dq else 0, do_remediation])
+    _op_count = sum([do_pii, do_dq, bool(_selected_ai_checks) if do_dq else 0, do_remediation])
     total_ops = len(input_files) * max(_op_count, 1)
     completed = 0
     progress = st.progress(0, text="Starting pipeline…")
@@ -881,22 +881,20 @@ if run_clicked and uploaded_files and (do_pii or do_dq or do_remediation):
                 pr.errors.append(f"DQ validation failed: {log.response_preview[:120]}")
             completed += 1
 
-            # --- AI DQ checks — one API call per selected check ---
+            # --- AI DQ checks — one upload/request for all selected checks ---
             merged_ai: dict[str, Any] = {"checks_run": []}
-            for param, check_label in _selected_ai_checks:
+            if _selected_ai_checks:
                 call_seq += 1
-                progress.progress(
-                    completed / total_ops,
-                    text=f"{check_label} → {file_name}",
-                )
+                check_labels = ", ".join(label for _, label in _selected_ai_checks)
+                progress.progress(completed / total_ops, text=f"AI DQ checks → {file_name}")
                 log, body = _call_api(
                     seq=call_seq,
-                    label=f"{check_label}  |  {file_name}",
+                    label=f"AI DQ checks ({check_labels})  |  {file_name}",
                     method="POST",
                     url=f"{api_base.rstrip('/')}/quality/ai-analysis/file",
                     file_name=file_name,
                     file_bytes=file_bytes,
-                    params={param: "true"},
+                    params={param: "true" for param, _ in _selected_ai_checks},
                     api_key=api_key,
                 )
                 api_logs.append(log)
@@ -907,7 +905,7 @@ if run_clicked and uploaded_files and (do_pii or do_dq or do_remediation):
                         if k != "checks_run":
                             merged_ai[k] = v
                 else:
-                    pr.errors.append(f"{check_label} failed: {log.response_preview[:120]}")
+                    pr.errors.append(f"AI DQ checks failed: {log.response_preview[:120]}")
                 completed += 1
 
             if merged_ai["checks_run"]:
