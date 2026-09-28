@@ -525,7 +525,7 @@ st.set_page_config(page_title="Pre-Ingestion PII Tool", page_icon="🔎", layout
 
 st.title("Pre-Ingestion PII Tool")
 run_clicked = st.button("Scan", type="primary", key="main_scan_button")
-st.caption("Scan files locally for PII before they leave your workstation.")
+st.caption("Scan files for PII and data quality issues before ingestion.")
 
 with st.sidebar:
     st.header("DQ API Backend")

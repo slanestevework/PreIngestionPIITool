@@ -1,0 +1,102 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: pii-scanner-app
+  labels:
+    app: pii-scanner-app
+  annotations:
+    image.openshift.io/triggers: '[{"from":{"kind":"ImageStreamTag","name":"pii-scanner-api:latest"},"fieldPath":"spec.template.spec.containers[?(@.name==\"app\")].image"}]'
+spec:
+  replicas: 1
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app: pii-scanner-app
+  template:
+    metadata:
+      labels:
+        app: pii-scanner-app
+    spec:
+      containers:
+      - name: app
+        image: image-registry.openshift-image-registry.svc:5000/48572-imoapi-xgd502np-ts/pii-scanner-api:latest
+        imagePullPolicy: Always
+        command:
+        - python
+        - -m
+        - streamlit
+        args:
+        - run
+        - app.py
+        - --server.address=0.0.0.0
+        - --server.port=8501
+        - --server.headless=true
+        - --browser.gatherUsageStats=false
+        - --server.maxUploadSize=2048
+        ports:
+        - containerPort: 8501
+          name: http
+        env:
+        - name: PII_SCANNER_API_BASE
+          value: http://pii-scanner-api:8000
+        - name: PII_SCANNER_API_KEY
+          valueFrom:
+            secretKeyRef:
+              name: pii-scanner-secret
+              key: api-key
+        readinessProbe:
+          httpGet:
+            path: /_stcore/health
+            port: http
+          initialDelaySeconds: 10
+          periodSeconds: 10
+          timeoutSeconds: 3
+          failureThreshold: 6
+        livenessProbe:
+          httpGet:
+            path: /_stcore/health
+            port: http
+          initialDelaySeconds: 30
+          periodSeconds: 20
+          timeoutSeconds: 3
+          failureThreshold: 3
+        resources:
+          requests:
+            cpu: 100m
+            memory: 512Mi
+          limits:
+            cpu: "1"
+            memory: 3Gi
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: pii-scanner-app
+  labels:
+    app: pii-scanner-app
+spec:
+  selector:
+    app: pii-scanner-app
+  ports:
+  - name: http
+    port: 8501
+    targetPort: http
+---
+apiVersion: route.openshift.io/v1
+kind: Route
+metadata:
+  name: pii-scanner-app
+  labels:
+    app: pii-scanner-app
+  annotations:
+    haproxy.router.openshift.io/timeout: 1h
+spec:
+  to:
+    kind: Service
+    name: pii-scanner-app
+  port:
+    targetPort: http
+  tls:
+    termination: edge
+    insecureEdgeTerminationPolicy: Redirect
