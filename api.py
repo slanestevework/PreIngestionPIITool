@@ -8,7 +8,7 @@ from typing import Any
 
 import pandas as pd
 from fastavro import reader
-from fastapi import Depends, FastAPI, File, Header, HTTPException, UploadFile
+from fastapi import Depends, FastAPI, File, Header, HTTPException, Query, UploadFile
 from pydantic import BaseModel, Field
 
 from scanner import scan_dataframe
@@ -226,6 +226,7 @@ async def quality_ai_analysis_file(
     consistency: bool = False,
     completeness: bool = False,
     auto_expectations: bool = False,
+    known_pii_columns: list[str] = Query(default=[]),
 ) -> dict[str, Any]:
     """Run AI-powered DQ checks (Azure OpenAI + Isolation Forest) on an uploaded file."""
     extension = Path(file.filename or "").suffix.lower().lstrip(".")
@@ -274,7 +275,10 @@ async def quality_ai_analysis_file(
 
     if semantic_pii:
         try:
-            risks = assess_semantic_pii_risk(df)
+            risks = assess_semantic_pii_risk(
+                df,
+                known_pii_columns=set(known_pii_columns),
+            )
             result["semantic_pii_risks"] = [
                 {"column": r.column, "risk": r.risk, "reason": r.reason} for r in risks
             ]

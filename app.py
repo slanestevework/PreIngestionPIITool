@@ -3,39 +3,38 @@ from __future__ import annotations
 import io
 import json
 import hashlib
+import os
+import random
 import re
 import zipfile
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Hashable
+from typing import Any, Hashable, cast
 
 import pandas as pd
+import requests
 from fastavro import reader, writer as avro_writer
 import streamlit as st
 
+if os.name == "nt":
+    import truststore
+
+    truststore.inject_into_ssl()
+
 from data_quality import (
-    validate_input,
     validate_output,
+    DQFailure,
     DQReport,
-    detect_anomalies,
     AnomalyResult,
-    generate_narrative,
-    assess_semantic_pii_risk,
     SemanticRisk,
-    assess_regulatory_risk,
     RegulatoryFlag,
-    detect_quasi_identifiers,
     QuasiIdentifierGroup,
-    detect_format_anomalies,
     FormatAnomaly,
-    assess_value_plausibility,
     PlausibilityIssue,
-    detect_consistency_violations,
     ConsistencyIssue,
-    assess_completeness,
     CompletenessIssue,
     AutoExpectationRun,
-    run_auto_expectations,
+    AutoExpectationSpec,
 )
 from patterns import PII_REGEXES
 from scanner import scan_dataframe
@@ -91,6 +90,9 @@ class InputFile:
     payload: bytes
 
 
+LARGE_FILE_BYTES = 100 * 1024 * 1024
+
+
 def _load_json_dataframe_from_bytes(payload: bytes) -> pd.DataFrame:
     # First try standard JSON (object/array), then fall back to JSONL.
     text_content = payload.decode("utf-8-sig")
@@ -139,14 +141,56 @@ def load_uploaded_dataframe(file_name: str, file_bytes: bytes) -> tuple[pd.DataF
     )
 
 
-def expand_input_files(uploaded_files) -> list[InputFile]:
+def _sample_uploaded_avro_for_analysis(
+    file_name: str,
+    uploaded_file,
+    max_rows: int,
+) -> tuple[str, bytes, int]:
+    """Stream a bounded deterministic sample from an uploaded Avro file."""
+    uploaded_file.seek(0)
+    reservoir: list[dict[str, Any]] = []
+    seen = 0
+    rng = random.Random(42)
+    for record in reader(uploaded_file):
+        seen += 1
+        record_dict = cast(dict[str, Any], record)
+        if len(reservoir) < max_rows:
+            reservoir.append(record_dict)
+            continue
+        replacement = rng.randrange(seen)
+        if replacement < max_rows:
+            reservoir[replacement] = record_dict
+
+    sample_name = f"{Path(file_name).stem}.sample.csv"
+    sample_bytes = pd.DataFrame(reservoir).to_csv(index=False).encode("utf-8")
+    return sample_name, sample_bytes, seen
+
+
+def expand_input_files(
+    uploaded_files,
+    sample_large_files: bool = False,
+    sample_row_limit: int = 1000,
+) -> list[InputFile]:
     expanded: list[InputFile] = []
 
     for uploaded in uploaded_files:
         file_name = uploaded.name
-        file_bytes = uploaded.getvalue()
         extension = Path(file_name).suffix.lower().lstrip(".")
 
+        if (
+            sample_large_files
+            and extension == "avro"
+            and uploaded.size >= LARGE_FILE_BYTES
+        ):
+            sample_name, sample_bytes, _ = _sample_uploaded_avro_for_analysis(
+                file_name,
+                uploaded,
+                sample_row_limit,
+            )
+            expanded.append(InputFile(name=sample_name, payload=sample_bytes))
+            continue
+
+        file_bytes = uploaded.getvalue()
         if extension != "zip":
             expanded.append(InputFile(name=file_name, payload=file_bytes))
             continue
@@ -169,6 +213,96 @@ def expand_input_files(uploaded_files) -> list[InputFile]:
 
 def format_size_mb(file_size_bytes: int) -> float:
     return round(file_size_bytes / (1024 * 1024), 2)
+
+
+def _post_quality_file(
+    api_base: str,
+    endpoint: str,
+    file_name: str,
+    payload: bytes,
+    api_key: str,
+    params: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    headers = {"X-API-Key": api_key} if api_key else {}
+    try:
+        response = requests.post(
+            f"{api_base.rstrip('/')}{endpoint}",
+            files={"file": (file_name, io.BytesIO(payload))},
+            params=params or {},
+            headers=headers,
+            timeout=330,
+        )
+    except requests.RequestException as exc:
+        raise RuntimeError(f"Could not reach the DQ API at {api_base}: {exc}") from exc
+
+    try:
+        result = response.json()
+    except ValueError:
+        result = {"detail": response.text}
+
+    if response.status_code >= 300:
+        detail = result.get("detail", result) if isinstance(result, dict) else result
+        raise RuntimeError(f"DQ API returned HTTP {response.status_code}: {detail}")
+    if not isinstance(result, dict):
+        raise RuntimeError("DQ API returned an unexpected response format.")
+    return result
+
+
+def _dq_report_from_payload(payload: dict[str, Any]) -> DQReport:
+    return DQReport(
+        passed=bool(payload.get("passed", False)),
+        evaluated=int(payload.get("evaluated", 0)),
+        successful=int(payload.get("successful", 0)),
+        failed=int(payload.get("failed", 0)),
+        failures=[
+            DQFailure(
+                expectation=str(item.get("expectation", "")),
+                column=item.get("column"),
+                details=item.get("details", {}),
+            )
+            for item in payload.get("failures", [])
+        ],
+    )
+
+
+def _auto_expectation_from_payload(payload: dict[str, Any]) -> AutoExpectationRun:
+    passed = int(payload.get("passed", 0))
+    failed = int(payload.get("failed", 0))
+    executed = int(payload.get("executed_count", 0))
+    report = None
+    if executed:
+        report = DQReport(
+            passed=failed == 0,
+            evaluated=executed,
+            successful=passed,
+            failed=failed,
+            failures=[
+                DQFailure(
+                    expectation=str(item.get("expectation", "")),
+                    column=item.get("column"),
+                    details=item.get("details", {}),
+                )
+                for item in payload.get("failures", [])
+            ],
+        )
+
+    return AutoExpectationRun(
+        specs=[
+            AutoExpectationSpec(
+                expectation_type=str(item.get("expectation_type", "")),
+                column=str(item.get("column", "")),
+                kwargs={},
+                rationale=str(item.get("rationale", "")),
+                confidence=str(item.get("confidence", "")),
+                generation_source=str(item.get("generation_source", "LLM")),
+            )
+            for item in payload.get("specs", [])
+        ],
+        outcomes=payload.get("outcomes", []),
+        report=report,
+        error=payload.get("error"),
+        diagnostic=payload.get("diagnostic"),
+    )
 
 
 def summarize_findings(findings_df: pd.DataFrame) -> dict[str, int]:
@@ -307,17 +441,118 @@ def dataframe_to_bytes(df: pd.DataFrame, extension: str) -> bytes:
     return df.to_csv(index=False).encode("utf-8")
 
 
+def _initialize_option_group(master_key: str, defaults: dict[str, Any]) -> None:
+    for key, value in defaults.items():
+        st.session_state.setdefault(key, value)
+    st.session_state.setdefault(
+        master_key,
+        all(bool(st.session_state[key]) for key in defaults),
+    )
+
+
+def _set_option_group(master_key: str, selected_values: dict[str, Any]) -> None:
+    selected = bool(st.session_state[master_key])
+    for key, value in selected_values.items():
+        st.session_state[key] = value if selected else ([] if isinstance(value, list) else False)
+
+
+def _sync_option_group(master_key: str, option_keys: list[str]) -> None:
+    st.session_state[master_key] = all(
+        bool(st.session_state.get(key)) for key in option_keys
+    )
+
+
+def _option_checkbox(
+    label: str,
+    key: str,
+    master_key: str,
+    option_keys: list[str],
+    **kwargs: Any,
+) -> bool:
+    return st.checkbox(
+        label,
+        key=key,
+        on_change=_sync_option_group,
+        args=(master_key, option_keys),
+        **kwargs,
+    )
+
+
+_SCAN_OPTIONS = {
+    "run_scan": True,
+    "include_presidio": True,
+    "show_samples": True,
+    "skip_large_files": True,
+}
+_DQ_OPTIONS = {
+    "run_dq": True,
+    "run_narrative": False,
+    "run_anomaly": False,
+    "run_plausibility": False,
+    "run_consistency": False,
+    "run_completeness": False,
+    "run_auto_dq_expectations": True,
+}
+_AI_PII_OPTIONS = {
+    "run_semantic": False,
+    "run_regulatory": False,
+    "run_quasi": False,
+    "run_format": False,
+}
+_CLOUD_REMEDIATION_OPTIONS = {
+    "build_anonymized": True,
+    "include_review_findings": True,
+    "selected_remediation_patterns": list(REMEDIATION_PATTERN_OPTIONS),
+    "strict_person_fallback": True,
+    "strict_location_fallback": True,
+    "strict_common_fallback": True,
+    "strict_date_fallback": True,
+}
+_ALL_SCAN_OPTIONS = {key: True for key in _SCAN_OPTIONS}
+_ALL_DQ_OPTIONS = {key: True for key in _DQ_OPTIONS}
+_ALL_AI_PII_OPTIONS = {key: True for key in _AI_PII_OPTIONS}
+_ALL_CLOUD_REMEDIATION_OPTIONS = dict(_CLOUD_REMEDIATION_OPTIONS)
+for _master_key, _defaults in [
+    ("scan_options_select_all", _SCAN_OPTIONS),
+    ("dq_select_all", _DQ_OPTIONS),
+    ("ai_pii_select_all", _AI_PII_OPTIONS),
+    ("cloud_remediation_select_all", _CLOUD_REMEDIATION_OPTIONS),
+]:
+    _initialize_option_group(_master_key, _defaults)
+
+
 st.set_page_config(page_title="Pre-Ingestion PII Tool", page_icon="🔎", layout="wide")
 
 st.title("Pre-Ingestion PII Tool")
+run_clicked = st.button("Scan", type="primary", key="main_scan_button")
 st.caption("Scan files locally for PII before they leave your workstation.")
 
 with st.sidebar:
+    st.header("DQ API Backend")
+    api_base = st.text_input(
+        "FastAPI base URL",
+        value=os.getenv("PII_SCANNER_API_BASE", "http://localhost:8000"),
+        help="Start the backend with: uvicorn api:app --reload",
+    )
+    configured_api_key = os.getenv("PII_SCANNER_API_KEY", "")
+    if configured_api_key:
+        api_key = configured_api_key
+        st.success("API authentication configured")
+    else:
+        api_key = st.text_input("API key (if required)", value="", type="password")
+
     st.header("Scan Options")
-    run_scan = st.checkbox("Detect PII", value=True)
-    include_presidio = st.checkbox("Include Presidio findings", value=True)
-    show_samples = st.checkbox("Show sample values", value=True)
-    skip_large_files = st.checkbox("Skip very large files", value=True)
+    st.checkbox(
+        "Select all",
+        key="scan_options_select_all",
+        help="Select or clear every option in Scan Options.",
+        on_change=_set_option_group,
+        args=("scan_options_select_all", _ALL_SCAN_OPTIONS),
+    )
+    run_scan = _option_checkbox("Detect PII", "run_scan", "scan_options_select_all", list(_SCAN_OPTIONS))
+    include_presidio = _option_checkbox("Include Presidio findings", "include_presidio", "scan_options_select_all", list(_SCAN_OPTIONS))
+    show_samples = _option_checkbox("Show sample values", "show_samples", "scan_options_select_all", list(_SCAN_OPTIONS))
+    skip_large_files = _option_checkbox("Skip very large files", "skip_large_files", "scan_options_select_all", list(_SCAN_OPTIONS))
     max_file_size_mb = st.number_input(
         "Max file size (MB)",
         min_value=1,
@@ -329,27 +564,50 @@ with st.sidebar:
     )
 
     st.header("Data Quality")
-    run_dq = st.checkbox("Run data quality checks", value=True)
-    run_narrative = st.checkbox("DQ failure narrative (Azure OpenAI)", value=False, disabled=not run_dq, help="GPT explains what is wrong and what to do when a check fails.")
-    run_anomaly = st.checkbox("Anomaly detection (AI)", value=False, disabled=not run_dq, help="Isolation Forest flags statistically unusual values per column.")
-    run_plausibility = st.checkbox("Value plausibility (Azure OpenAI)", value=False, disabled=not run_dq, help="GPT checks whether individual values make sense for their column.")
-    run_consistency = st.checkbox("Cross-column consistency (Azure OpenAI)", value=False, disabled=not run_dq, help="GPT checks for contradictions between columns (e.g. end date before start date).")
-    run_completeness = st.checkbox("Completeness assessment (Azure OpenAI)", value=False, disabled=not run_dq, help="GPT identifies columns that appear incomplete or companion columns that are missing.")
-    run_auto_dq_expectations = st.checkbox(
-        "Auto-generate expectations (Azure OpenAI)",
-        value=False,
+    st.checkbox(
+        "Select all",
+        key="dq_select_all",
+        help="Select or clear every Data Quality check.",
+        on_change=_set_option_group,
+        args=("dq_select_all", _ALL_DQ_OPTIONS),
+    )
+    run_dq = _option_checkbox("Run data quality checks", "run_dq", "dq_select_all", list(_DQ_OPTIONS))
+    run_narrative = _option_checkbox("DQ failure narrative (Azure OpenAI)", "run_narrative", "dq_select_all", list(_DQ_OPTIONS), disabled=not run_dq, help="GPT explains what is wrong and what to do when a check fails.")
+    run_anomaly = _option_checkbox("Anomaly detection (AI)", "run_anomaly", "dq_select_all", list(_DQ_OPTIONS), disabled=not run_dq, help="Isolation Forest flags statistically unusual values per column.")
+    run_plausibility = _option_checkbox("Value plausibility (Azure OpenAI)", "run_plausibility", "dq_select_all", list(_DQ_OPTIONS), disabled=not run_dq, help="GPT checks whether individual values make sense for their column.")
+    run_consistency = _option_checkbox("Cross-column consistency (Azure OpenAI)", "run_consistency", "dq_select_all", list(_DQ_OPTIONS), disabled=not run_dq, help="GPT checks for contradictions between columns (e.g. end date before start date).")
+    run_completeness = _option_checkbox("Completeness assessment (Azure OpenAI)", "run_completeness", "dq_select_all", list(_DQ_OPTIONS), disabled=not run_dq, help="GPT identifies columns that appear incomplete or companion columns that are missing.")
+    run_auto_dq_expectations = _option_checkbox(
+        "Generate and run LLM Great Expectations (Azure OpenAI)",
+        key="run_auto_dq_expectations",
+        master_key="dq_select_all",
+        option_keys=list(_DQ_OPTIONS),
         disabled=not run_dq,
-        help="GPT proposes additional Great Expectations checks from data profiling and validates them.",
+        help="Azure OpenAI proposes additional Great Expectations checks from data profiling; the API runs and reports them.",
     )
 
     st.header("AI — PII & Compliance")
-    run_semantic = st.checkbox("Semantic PII risk (Azure OpenAI)", value=False, help="GPT flags columns that look like PII but weren't caught by the scanner.")
-    run_regulatory = st.checkbox("Regulatory risk — HIPAA/GDPR/CCPA (Azure OpenAI)", value=False, help="GPT identifies columns that may trigger regulatory obligations.")
-    run_quasi = st.checkbox("Quasi-identifier detection (Azure OpenAI)", value=False, help="GPT identifies column combinations that together could re-identify individuals.")
-    run_format = st.checkbox("Format anomaly check (Azure OpenAI)", value=False, help="GPT checks whether values match the format implied by the column name.")
+    st.checkbox(
+        "Select all",
+        key="ai_pii_select_all",
+        help="Select or clear every AI PII and compliance check.",
+        on_change=_set_option_group,
+        args=("ai_pii_select_all", _ALL_AI_PII_OPTIONS),
+    )
+    run_semantic = _option_checkbox("Semantic PII risk (Azure OpenAI)", "run_semantic", "ai_pii_select_all", list(_AI_PII_OPTIONS), help="GPT flags columns that look like PII but weren't caught by the scanner.")
+    run_regulatory = _option_checkbox("Regulatory risk — HIPAA/GDPR/CCPA (Azure OpenAI)", "run_regulatory", "ai_pii_select_all", list(_AI_PII_OPTIONS), help="GPT identifies columns that may trigger regulatory obligations.")
+    run_quasi = _option_checkbox("Quasi-identifier detection (Azure OpenAI)", "run_quasi", "ai_pii_select_all", list(_AI_PII_OPTIONS), help="GPT identifies column combinations that together could re-identify individuals.")
+    run_format = _option_checkbox("Format anomaly check (Azure OpenAI)", "run_format", "ai_pii_select_all", list(_AI_PII_OPTIONS), help="GPT checks whether values match the format implied by the column name.")
 
     st.header("Cloud Remediation")
-    build_anonymized = st.checkbox("Generate cloud-ready files", value=True)
+    st.checkbox(
+        "Select all",
+        key="cloud_remediation_select_all",
+        help="Select or clear every Cloud Remediation option.",
+        on_change=_set_option_group,
+        args=("cloud_remediation_select_all", _ALL_CLOUD_REMEDIATION_OPTIONS),
+    )
+    build_anonymized = _option_checkbox("Generate cloud-ready files", "build_anonymized", "cloud_remediation_select_all", list(_CLOUD_REMEDIATION_OPTIONS))
     remediation_mode = st.selectbox(
         "Remediation strategy",
         options=["redact", "mask_last4", "hash"],
@@ -359,42 +617,54 @@ with st.sidebar:
             "hash": "Hash tokenize",
         }[x],
     )
-    include_review_findings = st.checkbox(
+    include_review_findings = _option_checkbox(
         "Also remediate REVIEW findings",
-        value=True,
+        key="include_review_findings",
+        master_key="cloud_remediation_select_all",
+        option_keys=list(_CLOUD_REMEDIATION_OPTIONS),
         help="REVIEW findings usually come from NLP and may include false positives.",
     )
     selected_remediation_patterns = st.multiselect(
         "PII types to remediate",
         options=REMEDIATION_PATTERN_OPTIONS,
-        default=REMEDIATION_PATTERN_OPTIONS,
+        key="selected_remediation_patterns",
+        on_change=_sync_option_group,
+        args=("cloud_remediation_select_all", list(_CLOUD_REMEDIATION_OPTIONS)),
         format_func=lambda p: f"{format_pattern_label(p, '')} ({p})",
         help="Only selected types will be redacted/masked/hashed in cloud-ready outputs.",
     )
-    strict_person_fallback = st.checkbox(
+    strict_person_fallback = _option_checkbox(
         "Strict fallback for missed names in narrative text",
-        value=True,
+        key="strict_person_fallback",
+        master_key="cloud_remediation_select_all",
+        option_keys=list(_CLOUD_REMEDIATION_OPTIONS),
         help=(
             "Adds a context-aware fallback for PERSON in phrases like "
             "'<Name> requested that documents be mailed'."
         ),
     )
-    strict_location_fallback = st.checkbox(
+    strict_location_fallback = _option_checkbox(
         "Strict fallback for missed locations in narrative text",
-        value=True,
+        key="strict_location_fallback",
+        master_key="cloud_remediation_select_all",
+        option_keys=list(_CLOUD_REMEDIATION_OPTIONS),
         help=(
             "Adds a context-aware fallback for mailing addresses and city/state/zip "
             "segments in narrative lines."
         ),
     )
-    strict_common_fallback = st.checkbox(
+    strict_common_fallback = _option_checkbox(
         "Strict fallback for common PII patterns",
-        value=True,
+        key="strict_common_fallback",
+        master_key="cloud_remediation_select_all",
+        option_keys=list(_CLOUD_REMEDIATION_OPTIONS),
         help="Adds regex/context fallbacks for email, phone, SSN, cards, accounts, EIN, and IP.",
     )
-    strict_date_fallback = st.checkbox(
+    strict_date_fallback = _option_checkbox(
         "Contextual date fallback (DOB/birth context)",
-        value=True,
+        key="strict_date_fallback",
+        master_key="cloud_remediation_select_all",
+        option_keys=list(_CLOUD_REMEDIATION_OPTIONS),
         disabled=not strict_common_fallback,
         help="Redacts date values only when DOB/birth context appears in the text.",
     )
@@ -404,7 +674,21 @@ with st.sidebar:
         disabled=remediation_mode != "hash",
         help="Used only for hash mode to produce deterministic tokens.",
     )
-    run_clicked = st.button("Scan", type="primary", width="stretch")
+
+run_ai_dq = any(
+    [
+        run_narrative,
+        run_anomaly,
+        run_semantic,
+        run_regulatory,
+        run_quasi,
+        run_format,
+        run_plausibility,
+        run_consistency,
+        run_completeness,
+        run_auto_dq_expectations,
+    ]
+)
 
 uploaded_files = st.file_uploader(
     "Upload multiple files or a ZIP archive",
@@ -412,8 +696,26 @@ uploaded_files = st.file_uploader(
     accept_multiple_files=True,
 )
 
+sample_large_files = st.checkbox(
+    "Use a representative sample for large Avro files",
+    value=True,
+    help="Streams Avro files of 100 MB or larger and uses a deterministic reservoir sample for PII, DQ, and remediation analysis.",
+)
+sample_row_limit = st.number_input(
+    "Maximum sampled rows",
+    min_value=100,
+    max_value=10000,
+    value=1000,
+    step=100,
+    disabled=not sample_large_files,
+)
+
 if uploaded_files:
-    input_files = expand_input_files(uploaded_files)
+    input_files = expand_input_files(
+        uploaded_files,
+        sample_large_files=sample_large_files,
+        sample_row_limit=int(sample_row_limit),
+    )
     st.info(f"{len(input_files)} file(s) queued for scan.")
     st.caption("You can select multiple files directly or upload a ZIP containing supported file types.")
 else:
@@ -421,8 +723,10 @@ else:
 
 if run_clicked and not input_files:
     st.warning("Upload at least one file to run the scan.")
+if run_clicked and input_files and not (run_scan or run_dq or run_ai_dq):
+    st.warning("Select PII detection or at least one data quality check.")
 
-if run_clicked and input_files and run_scan:
+if run_clicked and input_files and (run_scan or run_dq or run_ai_dq):
     scans: list[UploadedScan] = []
     all_findings: list[dict[str, Any]] = []
     all_stats: list[dict[str, Any]] = []
@@ -439,6 +743,7 @@ if run_clicked and input_files and run_scan:
     consistency_issues: dict[str, list[ConsistencyIssue]] = {}
     completeness_issues: dict[str, list[CompletenessIssue]] = {}
     auto_expectation_runs: dict[str, AutoExpectationRun] = {}
+    dq_api_errors: dict[str, dict[str, str]] = {}
 
     with st.spinner("Scanning files..."):
         for uploaded in input_files:
@@ -460,41 +765,119 @@ if run_clicked and input_files and run_scan:
             try:
                 df, ext = load_uploaded_dataframe(uploaded.name, uploaded.payload)
 
+                if run_scan:
+                    findings, stats = scan_dataframe(df, uploaded.name)
+                else:
+                    findings = []
+                    stats = {
+                        "source": uploaded.name,
+                        "columns_scanned": 0,
+                        "findings": 0,
+                    }
+
+                known_cols = {
+                    str(finding.get("column"))
+                    for finding in findings
+                    if finding.get("column")
+                }
+
                 if run_dq:
-                    dq_input_reports[uploaded.name] = validate_input(df)
+                    try:
+                        report_payload = _post_quality_file(
+                            api_base,
+                            "/quality/validate/file",
+                            uploaded.name,
+                            uploaded.payload,
+                            api_key,
+                        )
+                        dq_input_reports[uploaded.name] = _dq_report_from_payload(report_payload)
+                    except Exception as exc:
+                        dq_api_errors.setdefault(uploaded.name, {})["validation"] = str(exc)
 
-                if run_anomaly:
-                    anomaly_results[uploaded.name] = detect_anomalies(df)
+                if run_ai_dq:
+                    ai_params: dict[str, Any] = {
+                        "narrative": run_narrative,
+                        "anomaly": run_anomaly,
+                        "semantic_pii": run_semantic,
+                        "regulatory": run_regulatory,
+                        "quasi_id": run_quasi,
+                        "format_check": run_format,
+                        "plausibility": run_plausibility,
+                        "consistency": run_consistency,
+                        "completeness": run_completeness,
+                        "auto_expectations": run_auto_dq_expectations,
+                    }
+                    if run_semantic and known_cols:
+                        ai_params["known_pii_columns"] = sorted(known_cols)
 
-                findings, stats = scan_dataframe(df, uploaded.name)
-
-                if run_semantic:
-                    known_cols = {f.get("column") for f in findings if f.get("column")}
-                    semantic_risks[uploaded.name] = assess_semantic_pii_risk(df, known_pii_columns=known_cols)
-
-                if run_regulatory:
-                    regulatory_flags[uploaded.name] = assess_regulatory_risk(df)
-
-                if run_quasi:
-                    quasi_groups[uploaded.name] = detect_quasi_identifiers(df)
-
-                if run_format:
-                    format_anomalies[uploaded.name] = detect_format_anomalies(df)
-
-                if run_plausibility:
-                    plausibility_issues[uploaded.name] = assess_value_plausibility(df)
-
-                if run_consistency:
-                    consistency_issues[uploaded.name] = detect_consistency_violations(df)
-
-                if run_completeness:
-                    completeness_issues[uploaded.name] = assess_completeness(df)
-
-                if run_auto_dq_expectations:
-                    auto_expectation_runs[uploaded.name] = run_auto_expectations(
-                        df,
-                        suite_name=f"auto_dq_{Path(uploaded.name).stem}",
-                    )
+                    try:
+                        ai_result = _post_quality_file(
+                            api_base,
+                            "/quality/ai-analysis/file",
+                            uploaded.name,
+                            uploaded.payload,
+                            api_key,
+                            params=ai_params,
+                        )
+                        if run_narrative and ai_result.get("narrative"):
+                            dq_narratives[uploaded.name] = ai_result["narrative"]
+                        if run_anomaly:
+                            anomaly_results[uploaded.name] = [
+                                AnomalyResult(
+                                    column=item.get("column", ""),
+                                    anomalous_row_count=item.get("anomalous_row_count", 0),
+                                    total_rows=item.get("total_rows", 0),
+                                    anomaly_pct=item.get("anomaly_pct", 0),
+                                    explanation=item.get("explanation", ""),
+                                    sample_anomalous_values=item.get("sample_anomalous_values", []),
+                                )
+                                for item in ai_result.get("anomalies", [])
+                            ]
+                        if run_semantic:
+                            semantic_risks[uploaded.name] = [
+                                SemanticRisk(**item)
+                                for item in ai_result.get("semantic_pii_risks", [])
+                            ]
+                        if run_regulatory:
+                            regulatory_flags[uploaded.name] = [
+                                RegulatoryFlag(**item)
+                                for item in ai_result.get("regulatory_flags", [])
+                            ]
+                        if run_quasi:
+                            quasi_groups[uploaded.name] = [
+                                QuasiIdentifierGroup(**item)
+                                for item in ai_result.get("quasi_identifiers", [])
+                            ]
+                        if run_format:
+                            format_anomalies[uploaded.name] = [
+                                FormatAnomaly(**item)
+                                for item in ai_result.get("format_anomalies", [])
+                            ]
+                        if run_plausibility:
+                            plausibility_issues[uploaded.name] = [
+                                PlausibilityIssue(**item)
+                                for item in ai_result.get("plausibility_issues", [])
+                            ]
+                        if run_consistency:
+                            consistency_issues[uploaded.name] = [
+                                ConsistencyIssue(**item)
+                                for item in ai_result.get("consistency_issues", [])
+                            ]
+                        if run_completeness:
+                            completeness_issues[uploaded.name] = [
+                                CompletenessIssue(**item)
+                                for item in ai_result.get("completeness_issues", [])
+                            ]
+                        if run_auto_dq_expectations:
+                            auto_expectation_runs[uploaded.name] = _auto_expectation_from_payload(
+                                ai_result.get("auto_expectations", {})
+                            )
+                        if ai_result.get("errors"):
+                            dq_api_errors.setdefault(uploaded.name, {}).update(
+                                {key: str(value) for key, value in ai_result["errors"].items()}
+                            )
+                    except Exception as exc:
+                        dq_api_errors.setdefault(uploaded.name, {})["AI analysis"] = str(exc)
 
                 if not include_presidio:
                     findings = [
@@ -522,7 +905,11 @@ if run_clicked and input_files and run_scan:
                     FileStatus(
                         file_name=uploaded.name,
                         state="SUCCESS",
-                        detail=f"Scanned successfully with {len(findings)} finding(s)",
+                        detail=(
+                            f"Scanned successfully with {len(findings)} finding(s)"
+                            if run_scan
+                            else "Processed for data quality; PII scan was not selected"
+                        ),
                         size_mb=file_size_mb,
                     )
                 )
@@ -542,26 +929,23 @@ if run_clicked and input_files and run_scan:
     stats_df = pd.DataFrame(all_stats)
     risk_summary = summarize_findings(findings_df)
 
-    if run_dq and not findings_df.empty:
+    if run_scan and run_dq and not findings_df.empty:
         dq_output_report = validate_output(findings_df)
 
-    if run_narrative:
-        for fname, report in dq_input_reports.items():
-            if not report.passed:
-                try:
-                    dq_narratives[fname] = generate_narrative(report, file_name=fname)
-                except Exception:
-                    dq_narratives[fname] = ""
-
-    c1, c2, c3, c4, c5 = st.columns(5)
-    c1.metric("CRITICAL", risk_summary["CRITICAL"])
-    c2.metric("HIGH", risk_summary["HIGH"])
-    c3.metric("MEDIUM", risk_summary["MEDIUM"])
-    c4.metric("LOW", risk_summary["LOW"])
-    c5.metric("REVIEW", risk_summary["REVIEW"])
+    if run_scan:
+        c1, c2, c3, c4, c5 = st.columns(5)
+        c1.metric("CRITICAL", risk_summary["CRITICAL"])
+        c2.metric("HIGH", risk_summary["HIGH"])
+        c3.metric("MEDIUM", risk_summary["MEDIUM"])
+        c4.metric("LOW", risk_summary["LOW"])
+        c5.metric("REVIEW", risk_summary["REVIEW"])
+    else:
+        st.info("PII detection was not selected.")
 
     st.subheader("Top Findings")
-    if findings_df.empty:
+    if not run_scan:
+        st.info("Enable Detect PII to generate findings.")
+    elif findings_df.empty:
         st.info("No findings detected for selected options.")
     else:
         top = (
@@ -633,13 +1017,41 @@ if run_clicked and input_files and run_scan:
 
     findings_bytes = findings_df.to_csv(index=False).encode("utf-8")
 
-    if run_dq and (dq_input_reports or dq_output_report):
+    if (run_dq or run_ai_dq) and (
+        dq_input_reports
+        or dq_output_report
+        or anomaly_results
+        or dq_narratives
+        or semantic_risks
+        or regulatory_flags
+        or quasi_groups
+        or format_anomalies
+        or plausibility_issues
+        or consistency_issues
+        or completeness_issues
+        or auto_expectation_runs
+        or dq_api_errors
+    ):
         st.subheader("Data Quality")
         if dq_input_reports:
-            with st.expander("File quality checks", expanded=any(not r.passed for r in dq_input_reports.values())):
+            with st.expander("File quality checks", expanded=True):
                 for fname, report in dq_input_reports.items():
                     status = "✅ passed" if report.passed else "❌ failed"
                     st.markdown(f"**{fname}** — {status} ({report.successful}/{report.evaluated} checks)")
+                    score = round(report.successful / report.evaluated * 100) if report.evaluated else 0
+                    score_cols = st.columns(4)
+                    score_cols[0].metric("Quality Score", f"{score}%")
+                    score_cols[1].metric("Checks Run", report.evaluated)
+                    score_cols[2].metric("Passed", report.successful)
+                    score_cols[3].metric("Failed", report.failed)
+                    if report.evaluated == 0:
+                        st.info("No Great Expectations checks were run for this file.")
+                    elif score >= 90:
+                        st.success(f"Data quality is **{score}%** — meets threshold.")
+                    elif score >= 70:
+                        st.warning(f"Data quality is **{score}%** — review failures below.")
+                    else:
+                        st.error(f"Data quality is **{score}%** — significant issues detected.")
                     if report.failures:
                         rows = [
                             {"issue": f.expectation, "column": f.column or "", **f.details}
@@ -649,6 +1061,73 @@ if run_clicked and input_files and run_scan:
                     narrative = dq_narratives.get(fname, "")
                     if narrative:
                         st.info(f"**AI summary:** {narrative}")
+        if run_dq:
+            st.markdown("#### LLM-Generated Great Expectations")
+            if not run_auto_dq_expectations:
+                st.info("LLM-generated expectations are disabled in the Data Quality options.")
+            elif not auto_expectation_runs:
+                st.info("No LLM expectation results were returned. Check the DQ API errors below.")
+            else:
+                for fname, auto_run in auto_expectation_runs.items():
+                    st.markdown(f"**{fname}**")
+                    if auto_run.error:
+                        st.warning(f"Could not generate expectations: {auto_run.error}")
+                        if auto_run.diagnostic and auto_run.diagnostic.get("hint"):
+                            st.caption(auto_run.diagnostic["hint"])
+                        continue
+
+                    report = auto_run.report
+                    if report is None:
+                        st.info("No generated expectations were available to execute.")
+                        if auto_run.diagnostic and auto_run.diagnostic.get("hint"):
+                            st.caption(auto_run.diagnostic["hint"])
+                        continue
+
+                    score = round(report.success_rate * 100)
+                    score_cols = st.columns(4)
+                    score_cols[0].metric("LLM Quality Score", f"{score}%")
+                    score_cols[1].metric("Expectations Run", report.evaluated)
+                    score_cols[2].metric("Passed", report.successful)
+                    score_cols[3].metric("Failed", report.failed)
+                    if score >= 90:
+                        st.success(f"LLM expectations pass at **{score}%**.")
+                    elif score >= 70:
+                        st.warning(f"LLM expectations pass at **{score}%** — review failures.")
+                    else:
+                        st.error(f"LLM expectations pass at **{score}%** — significant issues.")
+
+                    outcome_rows = [
+                        {
+                            "status": outcome["status_icon"],
+                            "expectation": outcome["expectation_label"],
+                            "column": outcome["column"],
+                            "source": outcome.get("generation_source", "LLM"),
+                            "confidence": outcome["confidence"],
+                            "why this expectation was created": outcome["rationale"],
+                            "params": json.dumps(outcome["params"], ensure_ascii=False),
+                        }
+                        for outcome in auto_run.outcomes
+                    ]
+                    if outcome_rows:
+                        st.dataframe(pd.DataFrame(outcome_rows), width="stretch")
+
+                    failed_rows = [
+                        {
+                            "expectation": outcome["expectation_label"],
+                            "column": outcome["column"],
+                            "why failed": outcome["failure_details"].get("why_failed", ""),
+                            **{
+                                key: value
+                                for key, value in outcome["failure_details"].items()
+                                if key != "why_failed"
+                            },
+                        }
+                        for outcome in auto_run.outcomes
+                        if outcome.get("passed") is False
+                    ]
+                    if failed_rows:
+                        st.caption("Failed expectations and reasons")
+                        st.dataframe(pd.DataFrame(failed_rows), width="stretch")
         if anomaly_results:
             flagged = {f: [a for a in anoms if a.flagged] for f, anoms in anomaly_results.items()}
             any_flagged = any(flagged.values())
@@ -739,62 +1218,6 @@ if run_clicked and input_files and run_scan:
                     st.markdown(f"**{fname}** — ⚠️ {len(issues)} completeness gap(s)")
                     rows = [{"column": i.column, "severity": i.severity, "issue": i.issue} for i in issues]
                     st.dataframe(pd.DataFrame(rows), width="stretch")
-        if auto_expectation_runs:
-            any_failed = any(
-                run.report is not None and not run.report.passed
-                for run in auto_expectation_runs.values()
-            )
-            with st.expander("AI-generated expectations (preview)", expanded=any_failed):
-                for fname, auto_run in auto_expectation_runs.items():
-                    if auto_run.error:
-                        st.markdown(f"**{fname}** — ⚠️ unable to generate expectations")
-                        st.warning(auto_run.error)
-                        continue
-
-                    report = auto_run.report
-                    if report is None:
-                        st.markdown(f"**{fname}** — ⚠️ no generated expectations")
-                        continue
-
-                    status = "✅ passed" if report.passed else "❌ failed"
-                    st.markdown(
-                        f"**{fname}** — {status} ({report.successful}/{report.evaluated} checks)"
-                    )
-
-                    outcome_rows = [
-                        {
-                            "status": outcome["status_icon"],
-                            "expectation": outcome["expectation_label"],
-                            "column": outcome["column"],
-                            "confidence": outcome["confidence"],
-                            "why this expectation was created": outcome["rationale"],
-                            "params": json.dumps(outcome["params"], ensure_ascii=False),
-                        }
-                        for outcome in auto_run.outcomes
-                    ]
-                    st.caption("Generated expectations and pass/fail status")
-                    st.dataframe(pd.DataFrame(outcome_rows), width="stretch")
-
-                    failed_rows = [
-                        {
-                            "expectation": outcome["expectation_label"],
-                            "column": outcome["column"],
-                            "why failed": outcome["failure_details"].get("why_failed", ""),
-                            **{
-                                k: v
-                                for k, v in outcome["failure_details"].items()
-                                if k != "why_failed"
-                            },
-                        }
-                        for outcome in auto_run.outcomes
-                        if outcome.get("passed") is False
-                    ]
-
-                    st.caption("Failed expectations and reasons")
-                    if failed_rows:
-                        st.dataframe(pd.DataFrame(failed_rows), width="stretch")
-                    else:
-                        st.success("All generated expectations passed for this file.")
         if dq_output_report:
             with st.expander("Scanner diagnostics (advanced)", expanded=not dq_output_report.passed):
                 status = "✅ passed" if dq_output_report.passed else "❌ failed"
@@ -805,15 +1228,22 @@ if run_clicked and input_files and run_scan:
                         for f in dq_output_report.failures
                     ]
                     st.dataframe(pd.DataFrame(rows), width="stretch")
+        if dq_api_errors:
+            with st.expander("DQ API errors", expanded=True):
+                for fname, errors in dq_api_errors.items():
+                    st.markdown(f"**{fname}**")
+                    for check, message in errors.items():
+                        st.error(f"{check}: {message}")
 
-    st.download_button(
-        "Download Findings CSV",
-        data=findings_bytes,
-        file_name="pii_findings.csv",
-        mime="text/csv",
-    )
+    if run_scan:
+        st.download_button(
+            "Download Findings CSV",
+            data=findings_bytes,
+            file_name="pii_findings.csv",
+            mime="text/csv",
+        )
 
-    if build_anonymized and scans:
+    if run_scan and build_anonymized and scans:
         zip_buffer = io.BytesIO()
         remediation_records: list[RemediationRecord] = []
         with zipfile.ZipFile(zip_buffer, mode="w", compression=zipfile.ZIP_DEFLATED) as zf:
