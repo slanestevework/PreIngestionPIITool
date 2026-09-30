@@ -363,10 +363,21 @@ async def quality_ai_analysis_file(
     if auto_expectations:
         # run_auto_expectations catches its own exceptions internally
         auto_run = run_auto_expectations(df)
+        auto_narrative = ""
+        if narrative and auto_run.report is not None:
+            try:
+                auto_narrative = generate_narrative(
+                    auto_run.report,
+                    file_name=f"{source_name} (LLM-generated expectations)",
+                )
+            except Exception as exc:
+                result["errors"]["auto_expectations_narrative"] = str(exc)
+
         result["auto_expectations"] = {
             "proposed_count": len(auto_run.specs),
             "executed_count": len(auto_run.outcomes),   # distinct from passed — means "run"
             "error": auto_run.error,
+            "narrative": auto_narrative,
             "diagnostic": auto_run.diagnostic,
             "passed": auto_run.report.successful if auto_run.report else 0,
             "failed": auto_run.report.failed if auto_run.report else 0,

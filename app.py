@@ -572,7 +572,7 @@ with st.sidebar:
         args=("dq_select_all", _ALL_DQ_OPTIONS),
     )
     run_dq = _option_checkbox("Run data quality checks", "run_dq", "dq_select_all", list(_DQ_OPTIONS))
-    run_narrative = _option_checkbox("DQ failure narrative (Azure OpenAI)", "run_narrative", "dq_select_all", list(_DQ_OPTIONS), disabled=not run_dq, help="GPT explains what is wrong and what to do when a check fails.")
+    run_narrative = _option_checkbox("DQ failure narrative (Azure OpenAI)", "run_narrative", "dq_select_all", list(_DQ_OPTIONS), disabled=not run_dq, help="GPT summarizes failures in both baseline and LLM-generated Great Expectations.")
     run_anomaly = _option_checkbox("Anomaly detection (AI)", "run_anomaly", "dq_select_all", list(_DQ_OPTIONS), disabled=not run_dq, help="Isolation Forest flags statistically unusual values per column.")
     run_plausibility = _option_checkbox("Value plausibility (Azure OpenAI)", "run_plausibility", "dq_select_all", list(_DQ_OPTIONS), disabled=not run_dq, help="GPT checks whether individual values make sense for their column.")
     run_consistency = _option_checkbox("Cross-column consistency (Azure OpenAI)", "run_consistency", "dq_select_all", list(_DQ_OPTIONS), disabled=not run_dq, help="GPT checks for contradictions between columns (e.g. end date before start date).")
@@ -743,6 +743,7 @@ if run_clicked and input_files and (run_scan or run_dq or run_ai_dq):
     consistency_issues: dict[str, list[ConsistencyIssue]] = {}
     completeness_issues: dict[str, list[CompletenessIssue]] = {}
     auto_expectation_runs: dict[str, AutoExpectationRun] = {}
+    auto_expectation_narratives: dict[str, str] = {}
     dq_api_errors: dict[str, dict[str, str]] = {}
 
     with st.spinner("Scanning files..."):
@@ -869,9 +870,12 @@ if run_clicked and input_files and (run_scan or run_dq or run_ai_dq):
                                 for item in ai_result.get("completeness_issues", [])
                             ]
                         if run_auto_dq_expectations:
+                            auto_expectation_payload = ai_result.get("auto_expectations", {})
                             auto_expectation_runs[uploaded.name] = _auto_expectation_from_payload(
-                                ai_result.get("auto_expectations", {})
+                                auto_expectation_payload
                             )
+                            if auto_expectation_payload.get("narrative"):
+                                auto_expectation_narratives[uploaded.name] = auto_expectation_payload["narrative"]
                         if ai_result.get("errors"):
                             dq_api_errors.setdefault(uploaded.name, {}).update(
                                 {key: str(value) for key, value in ai_result["errors"].items()}
@@ -1095,6 +1099,9 @@ if run_clicked and input_files and (run_scan or run_dq or run_ai_dq):
                         st.warning(f"LLM expectations pass at **{score}%** — review failures.")
                     else:
                         st.error(f"LLM expectations pass at **{score}%** — significant issues.")
+
+                    if auto_expectation_narratives.get(fname):
+                        st.info(f"**AI summary:** {auto_expectation_narratives[fname]}")
 
                     outcome_rows = [
                         {
